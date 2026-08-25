@@ -8,7 +8,7 @@ which points to the https://github.com/mlflow/skills repository.
 import shutil
 from dataclasses import dataclass
 from importlib import resources
-from importlib.abc import Traversable
+from importlib.resources.abc import Traversable
 from pathlib import Path
 
 from mlflow.ai_commands.ai_command_utils import parse_frontmatter
