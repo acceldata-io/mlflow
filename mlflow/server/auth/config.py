@@ -2,7 +2,7 @@ import configparser
 from pathlib import Path
 from typing import NamedTuple
 
-from mlflow.environment_variables import MLFLOW_AUTH_CONFIG_PATH
+from mlflow.environment_variables import MLFLOW_AUTH_ADMIN_PASSWORD, MLFLOW_AUTH_CONFIG_PATH
 
 DEFAULT_AUTHORIZATION_FUNCTION = "mlflow.server.auth:authenticate_request_basic_auth"
 
@@ -35,7 +35,8 @@ def read_auth_config() -> AuthConfig:
         default_permission=config["mlflow"]["default_permission"],
         database_uri=config["mlflow"]["database_uri"],
         admin_username=config["mlflow"]["admin_username"],
-        admin_password=config["mlflow"]["admin_password"],
+        admin_password=MLFLOW_AUTH_ADMIN_PASSWORD.get()
+        or config["mlflow"].get("admin_password", ""),
         authorization_function=config["mlflow"].get(
             "authorization_function", DEFAULT_AUTHORIZATION_FUNCTION
         ),
