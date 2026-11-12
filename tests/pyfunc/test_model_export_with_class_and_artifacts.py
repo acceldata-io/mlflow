@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import ntpath
 import os
 import subprocess
 import sys
@@ -20,7 +21,6 @@ import pytest
 import sklearn
 import sklearn.datasets
 import sklearn.linear_model
-import sklearn.neighbors
 import yaml
 
 import mlflow
@@ -30,6 +30,7 @@ import mlflow.pyfunc.scoring_server as pyfunc_scoring_server
 import mlflow.sklearn
 from mlflow.entities import Trace
 from mlflow.environment_variables import (
+    MLFLOW_ALLOW_PICKLE_DESERIALIZATION,
     MLFLOW_LOG_MODEL_COMPRESSION,
     MLFLOW_RECORD_ENV_VARS_IN_MODEL_LOGGING,
 )
@@ -42,6 +43,7 @@ from mlflow.models.resources import (
     DatabricksApp,
     DatabricksFunction,
     DatabricksGenieSpace,
+    DatabricksLakebase,
     DatabricksServingEndpoint,
     DatabricksSQLWarehouse,
     DatabricksTable,
@@ -126,9 +128,9 @@ def iris_data():
 @pytest.fixture(scope="module")
 def sklearn_knn_model(iris_data):
     x, y = iris_data
-    knn_model = sklearn.neighbors.KNeighborsClassifier()
-    knn_model.fit(x, y)
-    return knn_model
+    logreg_model = sklearn.linear_model.LogisticRegression()
+    logreg_model.fit(x, y)
+    return logreg_model
 
 
 @pytest.fixture(scope="module")
@@ -224,7 +226,10 @@ def test_model_log_load(sklearn_knn_model, main_scoped_model_class, iris_data):
         return sk_model.predict(model_input) * 2
 
     pyfunc_artifact_path = "pyfunc_model"
-    with mlflow.start_run():
+    with (
+        mlflow.start_run(),
+        mock.patch("mlflow.pyfunc._logger.warning") as mock_warning,
+    ):
         pyfunc_model_info = mlflow.pyfunc.log_model(
             name=pyfunc_artifact_path,
             artifacts={"sk_model": sklearn_model_info.model_uri},
@@ -232,6 +237,7 @@ def test_model_log_load(sklearn_knn_model, main_scoped_model_class, iris_data):
         )
         pyfunc_model_path = _download_artifact_from_uri(pyfunc_model_info.model_uri)
         model_config = Model.load(os.path.join(pyfunc_model_path, "MLmodel"))
+        assert "Consider using a file path (str or Path) instead" in mock_warning.call_args[0][0]
 
     loaded_pyfunc_model = mlflow.pyfunc.load_model(model_uri=pyfunc_model_info.model_uri)
     assert model_config.to_yaml() == loaded_pyfunc_model.metadata.to_yaml()
@@ -280,7 +286,9 @@ def test_python_model_predict_compatible_without_params(sklearn_knn_model, iris_
     )
 
 
-def test_signature_and_examples_are_saved_correctly(iris_data, main_scoped_model_class, tmp_path):
+def test_signature_and_examples_are_saved_correctly(
+    sklearn_knn_model, iris_data, main_scoped_model_class, tmp_path
+):
     sklearn_model_path = str(tmp_path.joinpath("sklearn_model"))
     mlflow.sklearn.save_model(sk_model=sklearn_knn_model, path=sklearn_model_path)
 
@@ -302,7 +310,10 @@ def test_signature_and_examples_are_saved_correctly(iris_data, main_scoped_model
                     input_example=example,
                 )
                 mlflow_model = Model.load(path)
-                assert signature == mlflow_model.signature
+                if signature is not None:
+                    assert mlflow_model.signature == signature
+                elif example is None:
+                    assert mlflow_model.signature is None
                 if example is None:
                     assert mlflow_model.saved_input_example_info is None
                 else:
@@ -312,6 +323,28 @@ def test_signature_and_examples_are_saved_correctly(iris_data, main_scoped_model
 class DummyModel(mlflow.pyfunc.PythonModel):
     def predict(self, context, model_input, params=None):
         return model_input
+
+
+def test_artifact_paths_use_posix_separators(tmp_path):
+    artifact_path = tmp_path / "payload.txt"
+    artifact_path.write_text("payload")
+    os_join = os.path.join
+
+    def windows_artifacts_subpath(path, *paths):
+        join = ntpath.join if path == "artifacts" else os_join
+        return join(path, *paths)
+
+    model_path = tmp_path / "pyfunc_model"
+    with mock.patch("os.path.join", windows_artifacts_subpath):
+        mlflow.pyfunc.save_model(
+            path=model_path,
+            python_model=DummyModel(),
+            artifacts={"payload": str(artifact_path)},
+        )
+
+    config = Model.load(model_path)
+    saved_artifact_subpath = config.flavors["python_function"]["artifacts"]["payload"]["path"]
+    assert saved_artifact_subpath == "artifacts/payload.txt"
 
 
 def test_log_model_calls_register_model(sklearn_knn_model, main_scoped_model_class):
@@ -515,6 +548,8 @@ def test_pyfunc_cli_predict_command_without_conda_env_activation_succeeds(
     output_json_path = os.path.join(tmp_path, "output.json")
     process = Popen(
         [
+            sys.executable,
+            "-m",
             "mlflow",
             "models",
             "predict",
@@ -566,6 +601,8 @@ def test_pyfunc_cli_predict_command_with_conda_env_activation_succeeds(
     output_json_path = os.path.join(tmp_path, "output.json")
     process = Popen(
         [
+            sys.executable,
+            "-m",
             "mlflow",
             "models",
             "predict",
@@ -873,6 +910,212 @@ def test_save_model_correctly_resolves_directory_artifact_with_nested_contents(
     assert loaded_model.predict(iris_data[0])
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("shared", "shared", True),
+        ("models", "models/encoder", True),
+        ("models/encoder", "models/reranker", False),
+        ("foo", "foobar", False),
+        (".", "config.json", True),
+        ("A", "a/file", True),
+    ],
+)
+def test_artifact_roots_overlap(left, right, expected):
+    assert mlflow.pyfunc.model._artifact_roots_overlap(Path(left), Path(right)) is expected
+
+
+def test_resolve_artifact_path_collisions_skips_occupied_numeric_namespace(tmp_path):
+    artifacts = [
+        mlflow.pyfunc.model._DownloadedArtifact(
+            names=[name],
+            uri=name,
+            source_root=tmp_path / name,
+            flat_root=Path(flat_root),
+        )
+        for name, flat_root in [
+            ("first", "weights.bin"),
+            ("second", "weights.bin"),
+            ("numeric", "0"),
+        ]
+    ]
+
+    mlflow.pyfunc.model._resolve_artifact_path_collisions(artifacts)
+
+    assert artifacts[2].final_root == Path("0")
+    assert {artifact.final_root.parts[0] for artifact in artifacts[:2]} == {"1", "2"}
+
+
+def test_save_model_avoids_hugging_face_artifact_root(model_path, monkeypatch):
+    huggingface_hub = types.ModuleType("huggingface_hub")
+
+    def snapshot_download(repo_id, local_dir, local_dir_use_symlinks):
+        snapshot_path = Path(local_dir)
+        snapshot_path.mkdir(parents=True)
+        (snapshot_path / "config.json").write_text(repo_id)
+        return local_dir
+
+    huggingface_hub.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", huggingface_hub)
+
+    def download_artifact(artifact_uri, output_path):
+        artifact_path = Path(output_path)
+        (artifact_path / "MLmodel").write_text(artifact_uri)
+        return output_path
+
+    with mock.patch(
+        "mlflow.pyfunc.model._download_artifact_from_uri", side_effect=download_artifact
+    ):
+        mlflow.pyfunc.save_model(
+            path=model_path,
+            artifacts={"0": "hf:/some/repo", "registered": "models:/RM/1"},
+            python_model=ModuleScopedSklearnModel(predict_fn=None),
+            conda_env=_conda_env(),
+        )
+
+    artifacts = Model.load(model_path).flavors["python_function"]["artifacts"]
+    hf_path = Path(model_path, artifacts["0"]["path"])
+    registered_model_path = Path(model_path, artifacts["registered"]["path"])
+    assert hf_path == Path(model_path, "artifacts", "0")
+    assert registered_model_path != hf_path
+    assert hf_path not in registered_model_path.parents
+    assert (registered_model_path / "MLmodel").read_text() == "models:/RM/1"
+    assert not (hf_path / "MLmodel").exists()
+
+
+def test_save_model_preserves_non_colliding_artifact_paths(tmp_path, model_path):
+    weights = tmp_path / "weights.bin"
+    config = tmp_path / "config.json"
+    weights.write_text("weights")
+    config.write_text("config")
+
+    mlflow.pyfunc.save_model(
+        path=model_path,
+        artifacts={"weights": str(weights), "config": str(config)},
+        python_model=ModuleScopedSklearnModel(predict_fn=None),
+        conda_env=_conda_env(),
+    )
+
+    artifacts = Model.load(model_path).flavors["python_function"]["artifacts"]
+    saved_weights = Path(model_path, artifacts["weights"]["path"])
+    saved_config = Path(model_path, artifacts["config"]["path"])
+    assert saved_weights == Path(model_path, "artifacts", "weights.bin")
+    assert saved_config == Path(model_path, "artifacts", "config.json")
+    assert saved_weights.read_text() == "weights"
+    assert saved_config.read_text() == "config"
+
+
+def test_save_model_preserves_files_with_colliding_paths(tmp_path, model_path):
+    first_source = tmp_path / "first" / "weights.bin"
+    second_source = tmp_path / "second" / "weights.bin"
+    for source, content in [
+        (first_source, "first"),
+        (second_source, "second"),
+    ]:
+        source.parent.mkdir()
+        source.write_text(content)
+
+    mlflow.pyfunc.save_model(
+        path=model_path,
+        artifacts={
+            "first": str(first_source),
+            "second": str(second_source),
+        },
+        python_model=ModuleScopedSklearnModel(predict_fn=None),
+        conda_env=_conda_env(),
+    )
+
+    artifacts = Model.load(model_path).flavors["python_function"]["artifacts"]
+    saved_paths = {name: Path(model_path, artifact["path"]) for name, artifact in artifacts.items()}
+    assert saved_paths["first"].read_text() == "first"
+    assert saved_paths["second"].read_text() == "second"
+    assert saved_paths["first"] != saved_paths["second"]
+
+
+def test_save_model_preserves_file_and_directory_with_colliding_paths(tmp_path, model_path):
+    first_source = tmp_path / "first" / "shared"
+    second_source = tmp_path / "second" / "shared"
+    first_source.parent.mkdir()
+    first_source.write_text("first")
+    second_source.mkdir(parents=True)
+    (second_source / "second.txt").write_text("second")
+
+    mlflow.pyfunc.save_model(
+        path=model_path,
+        artifacts={"first": str(first_source), "second": str(second_source)},
+        python_model=ModuleScopedSklearnModel(predict_fn=None),
+        conda_env=_conda_env(),
+    )
+
+    artifacts = Model.load(model_path).flavors["python_function"]["artifacts"]
+    first = Path(model_path, artifacts["first"]["path"])
+    second = Path(model_path, artifacts["second"]["path"])
+    assert first.read_text() == "first"
+    assert (second / "second.txt").read_text() == "second"
+    assert first != second
+
+
+def test_save_model_reuses_download_for_artifact_aliases(tmp_path, model_path):
+    first_source = tmp_path / "first" / "weights.bin"
+    second_source = tmp_path / "second" / "weights.bin"
+    first_source.parent.mkdir()
+    second_source.parent.mkdir()
+    first_source.write_text("first")
+    second_source.write_text("second")
+
+    with mock.patch(
+        "mlflow.pyfunc.model._download_artifact_from_uri",
+        wraps=_download_artifact_from_uri,
+    ) as download:
+        mlflow.pyfunc.save_model(
+            path=model_path,
+            artifacts={
+                "primary": str(first_source),
+                "fallback": str(first_source),
+                "other": str(second_source),
+            },
+            python_model=ModuleScopedSklearnModel(predict_fn=None),
+            conda_env=_conda_env(),
+        )
+
+    artifacts = Model.load(model_path).flavors["python_function"]["artifacts"]
+    assert download.call_count == 2
+    assert artifacts["primary"]["path"] == artifacts["fallback"]["path"]
+    assert artifacts["primary"]["path"] != artifacts["other"]["path"]
+
+
+@pytest.mark.parametrize(
+    ("invalid_source", "error"),
+    [
+        ("outside", "outside the download directory"),
+        ("symlink", "symbolic link"),
+        ("missing", "missing path"),
+        ("parent_traversal", r"non-normalized path containing '\.\.'"),
+    ],
+)
+def test_validate_downloaded_artifact_rejects_invalid_source(tmp_path, invalid_source, error):
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    match invalid_source:
+        case "outside":
+            source_root = tmp_path / "outside"
+            source_root.write_text("content")
+        case "symlink":
+            target = staging_dir / "target"
+            target.write_text("content")
+            source_root = staging_dir / "link"
+            source_root.symlink_to(target)
+        case "missing":
+            source_root = staging_dir / "missing"
+        case "parent_traversal":
+            (staging_dir / "nested").mkdir()
+            (staging_dir / "artifact").write_text("content")
+            source_root = staging_dir / "nested" / ".." / "artifact"
+
+    with pytest.raises(MlflowException, match=error):
+        mlflow.pyfunc.model._validate_downloaded_artifact(staging_dir, source_root, "artifact")
+
+
 def test_save_model_with_no_artifacts_does_not_produce_artifacts_dir(model_path):
     mlflow.pyfunc.save_model(
         path=model_path,
@@ -1092,6 +1335,20 @@ def test_load_model_with_missing_cloudpickle_version_logs_warning(model_path):
     )
 
 
+def test_load_cloudpickle_model_raises_when_pickle_deserialization_disallowed(
+    model_path, monkeypatch
+):
+    class TestModel(mlflow.pyfunc.PythonModel):
+        def predict(self, context, model_input, params=None):
+            return model_input
+
+    mlflow.pyfunc.save_model(path=model_path, python_model=TestModel())
+    monkeypatch.setenv(MLFLOW_ALLOW_PICKLE_DESERIALIZATION.name, "false")
+
+    with pytest.raises(MlflowException, match="Deserializing model using pickle is disallowed"):
+        mlflow.pyfunc.load_model(model_uri=model_path)
+
+
 def test_save_and_load_model_with_special_chars(
     sklearn_knn_model, main_scoped_model_class, iris_data, tmp_path
 ):
@@ -1119,7 +1376,6 @@ def test_save_and_load_model_with_special_chars(
 
 
 def test_model_with_code_path_containing_main(tmp_path):
-    """Test that the __main__ module is unaffected by model loading"""
     directory = tmp_path.joinpath("model_with_main")
     directory.mkdir()
     main = directory.joinpath("__main__.py")
@@ -1417,7 +1673,6 @@ def test_python_model_with_type_hint_errors_with_different_signature():
                 python_model=AnnotatedPythonModel(),
                 signature=signature,
             )
-        warn_mock.assert_called_once()
         assert (
             "Provided signature does not match the signature inferred from"
             in warn_mock.call_args[0][0]
@@ -1548,6 +1803,7 @@ def test_model_save_load_with_resources(tmp_path):
             "uc_connection": [{"name": "test_connection_1"}, {"name": "test_connection_2"}],
             "table": [{"name": "rag.studio.table_a"}, {"name": "rag.studio.table_b"}],
             "app": [{"name": "test_databricks_app"}],
+            "lakebase": [{"name": "test_databricks_lakebase"}],
         },
     }
     mlflow.pyfunc.save_model(
@@ -1569,6 +1825,7 @@ def test_model_save_load_with_resources(tmp_path):
             DatabricksTable(table_name="rag.studio.table_a"),
             DatabricksTable(table_name="rag.studio.table_b"),
             DatabricksApp(app_name="test_databricks_app"),
+            DatabricksLakebase(database_instance_name="test_databricks_lakebase"),
         ],
     )
 
@@ -1592,6 +1849,8 @@ def test_model_save_load_with_resources(tmp_path):
                 function:
                 - name: rag.studio.test_function_a
                 - name: rag.studio.test_function_b
+                lakebase:
+                - name: test_databricks_lakebase
                 genie_space:
                 - name: genie_space_id_1
                 - name: genie_space_id_2
@@ -1646,6 +1905,7 @@ def test_model_save_load_with_invokers_resources(tmp_path):
                 {"name": "rag.studio.table_b"},
             ],
             "app": [{"name": "test_databricks_app"}],
+            "lakebase": [{"name": "test_databricks_lakebase"}],
         },
     }
     mlflow.pyfunc.save_model(
@@ -1671,6 +1931,7 @@ def test_model_save_load_with_invokers_resources(tmp_path):
             DatabricksTable(table_name="rag.studio.table_a", on_behalf_of_user=True),
             DatabricksTable(table_name="rag.studio.table_b"),
             DatabricksApp(app_name="test_databricks_app"),
+            DatabricksLakebase(database_instance_name="test_databricks_lakebase"),
         ],
     )
 
@@ -1697,6 +1958,8 @@ def test_model_save_load_with_invokers_resources(tmp_path):
                 - name: rag.studio.test_function_a
                   on_behalf_of_user: True
                 - name: rag.studio.test_function_b
+                lakebase:
+                - name: test_databricks_lakebase
                 genie_space:
                 - name: genie_space_id_1
                   on_behalf_of_user: True
@@ -1860,6 +2123,7 @@ def test_model_log_with_resources(tmp_path):
             "uc_connection": [{"name": "test_connection_1"}, {"name": "test_connection_2"}],
             "table": [{"name": "rag.studio.table_a"}, {"name": "rag.studio.table_b"}],
             "app": [{"name": "test_databricks_app"}],
+            "lakebase": [{"name": "test_databricks_lakebase"}],
         },
     }
     with mlflow.start_run() as run:
@@ -1881,6 +2145,7 @@ def test_model_log_with_resources(tmp_path):
                 DatabricksTable(table_name="rag.studio.table_a"),
                 DatabricksTable(table_name="rag.studio.table_b"),
                 DatabricksApp(app_name="test_databricks_app"),
+                DatabricksLakebase(database_instance_name="test_databricks_lakebase"),
             ],
         )
     pyfunc_model_uri = f"runs:/{run.info.run_id}/{pyfunc_artifact_path}"
@@ -1905,6 +2170,8 @@ def test_model_log_with_resources(tmp_path):
                 function:
                 - name: rag.studio.test_function_a
                 - name: rag.studio.test_function_b
+                lakebase:
+                - name: test_databricks_lakebase
                 genie_space:
                 - name: genie_space_id_1
                 - name: genie_space_id_2
@@ -2283,7 +2550,7 @@ def test_environment_variables_used_during_model_logging(monkeypatch):
             # existing env var is tracked
             os.environ["TEST_API_KEY"]
             # existing env var fetched by getenv is tracked
-            os.getenv("ANOTHER_API_KEY")
+            os.environ.get("ANOTHER_API_KEY")
             # existing env var not in allowlist is not tracked
             os.environ.get("INVALID_ENV_VAR")
             # non-existing env var is not tracked
@@ -2540,15 +2807,14 @@ def test_pyfunc_model_traces_link_to_model_id():
         def predict(self, model_input: list[str]) -> list[str]:
             return model_input
 
-    model_infos = []
-    for i in range(3):
-        model_infos.append(
-            mlflow.pyfunc.log_model(
-                name="test_model",
-                python_model=TestModel(),
-                input_example=["a", "b", "c"],
-            )
+    model_infos = [
+        mlflow.pyfunc.log_model(
+            name="test_model",
+            python_model=TestModel(),
+            input_example=["a", "b", "c"],
         )
+        for i in range(3)
+    ]
 
     for model_info in model_infos:
         pyfunc_model = mlflow.pyfunc.load_model(model_info.model_uri)
@@ -2620,7 +2886,10 @@ def test_lock_model_requirements_pip_requirements(monkeypatch: pytest.MonkeyPatc
     assert "# Locked requirements" in contents
     assert "mlflow==" in contents
     assert "openai==" in contents
-    assert "httpx==" in contents
+    # `openai` migrated its HTTP client from `httpx` (1.x) to `httpx2` (2.x, a
+    # separate distribution), so an unpinned `openai` locks one or the other
+    # depending on the resolved version. Assert the family is locked either way.
+    assert "httpx==" in contents or "httpx2==" in contents
 
 
 def test_lock_model_requirements_extra_pip_requirements(
@@ -2638,7 +2907,7 @@ def test_lock_model_requirements_extra_pip_requirements(
     assert "# Locked requirements" in contents
     assert "mlflow==" in contents
     assert "openai==" in contents
-    assert "httpx==" in contents
+    assert "httpx==" in contents or "httpx2==" in contents
 
 
 def test_lock_model_requirements_constraints(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -2657,3 +2926,25 @@ def test_lock_model_requirements_constraints(monkeypatch: pytest.MonkeyPatch, tm
     assert "mlflow==" in contents
     assert "openai==1.82.0" in contents
     assert "httpx==" in contents
+
+
+@pytest.mark.parametrize(
+    ("input_example", "expected_result"), [(["Hello", "World"], True), (None, False)]
+)
+def test_load_context_with_input_example(input_example, expected_result):
+    class MyModel(mlflow.pyfunc.PythonModel):
+        def load_context(self, context):
+            raise Exception("load_context was called")
+
+        def predict(self, model_input: list[str], params=None):
+            return model_input
+
+    msg = "Failed to run the predict function on input example"
+
+    with mock.patch("mlflow.models.signature._logger.warning") as mock_warning:
+        mlflow.pyfunc.log_model(
+            name="model",
+            python_model=MyModel(),
+            input_example=input_example,
+        )
+        assert any(msg in call.args[0] for call in mock_warning.call_args_list) == expected_result

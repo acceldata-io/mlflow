@@ -1,15 +1,13 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any
 
 from mlflow.entities._mlflow_object import _MlflowObject
 from mlflow.protos.assessments_pb2 import AssessmentError as ProtoAssessmentError
-from mlflow.utils.annotations import experimental
 
 _STACK_TRACE_TRUNCATION_PREFIX = "[Stack trace is truncated]\n...\n"
-_STACK_TRACE_TRUNCATION_LENGTH = 1000
+_STACK_TRACE_TRUNCATION_LENGTH = 10000
 
 
-@experimental(version="2.21.0")
 @dataclass
 class AssessmentError(_MlflowObject):
     """
@@ -44,10 +42,10 @@ class AssessmentError(_MlflowObject):
     """
 
     error_code: str
-    error_message: Optional[str] = None
-    stack_trace: Optional[str] = None
+    error_message: str | None = None
+    stack_trace: str | None = None
 
-    def to_proto(self):
+    def to_proto(self) -> ProtoAssessmentError:
         error = ProtoAssessmentError()
         error.error_code = self.error_code
         if self.error_message:
@@ -61,14 +59,14 @@ class AssessmentError(_MlflowObject):
         return error
 
     @classmethod
-    def from_proto(cls, proto):
+    def from_proto(cls, proto: ProtoAssessmentError) -> "AssessmentError":
         return cls(
             error_code=proto.error_code,
             error_message=proto.error_message or None,
             stack_trace=proto.stack_trace or None,
         )
 
-    def to_dictionary(self):
+    def to_dictionary(self) -> dict[str, Any]:
         return {
             "error_code": self.error_code,
             "error_message": self.error_message,
@@ -76,5 +74,5 @@ class AssessmentError(_MlflowObject):
         }
 
     @classmethod
-    def from_dictionary(cls, error_dict):
+    def from_dictionary(cls, error_dict: dict[str, Any]) -> "AssessmentError":
         return cls(**error_dict)

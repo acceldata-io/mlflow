@@ -1,8 +1,8 @@
 import json
 import os
-from collections import namedtuple
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any, NamedTuple
 from unittest import mock
 
 import numpy as np
@@ -16,7 +16,6 @@ from prophet import Prophet
 import mlflow
 import mlflow.prophet
 import mlflow.pyfunc.scoring_server as pyfunc_scoring_server
-import mlflow.utils
 from mlflow import pyfunc
 from mlflow.models import Model, infer_signature
 from mlflow.models.utils import _read_example, load_serving_example
@@ -67,7 +66,10 @@ class DataGeneration:
         )
 
     def _generate_linear_data(self):
-        DataStruct = namedtuple("DataStruct", "dates, series")
+        class DataStruct(NamedTuple):
+            dates: Any
+            series: Any
+
         series = self._generate_raw()
         date_ranges = np.arange(
             self.start, self.start + timedelta(days=self.size), timedelta(days=1)
@@ -75,7 +77,10 @@ class DataGeneration:
         return DataStruct(date_ranges, series)
 
     def _generate_shift_data(self):
-        DataStruct = namedtuple("DataStruct", "dates, series")
+        class DataStruct(NamedTuple):
+            dates: Any
+            series: Any
+
         raw = self._generate_raw()[: int(self.size * 0.6)]
         temperature = np.concatenate((raw, raw / 2.0)).ravel()[: self.size]
         date_ranges = np.arange(
@@ -112,7 +117,10 @@ TARGET_FIELD_NAME = "yhat"
 DS_FORMAT = "%Y-%m-%dT%H:%M:%S"
 INFER_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-ModelWithSource = namedtuple("ModelWithSource", ["model", "data"])
+
+class ModelWithSource(NamedTuple):
+    model: Any
+    data: Any
 
 
 @pytest.fixture(scope="module")
@@ -289,6 +297,22 @@ def test_model_save_persists_specified_conda_env_in_mlflow_model_directory(
     assert prophet_custom_env_parsed == saved_conda_env_parsed
 
 
+@pytest.mark.parametrize(
+    ("version", "bounded"),
+    [
+        ("1.1.6", True),
+        ("1.2.1", True),
+        # 1.2.2 declares `pandas<3` itself and 1.3.0 supports pandas 3
+        ("1.2.2", False),
+        ("1.3.0", False),
+    ],
+)
+def test_default_pip_requirements_bounds_pandas_for_old_prophet(version, bounded):
+    with mock.patch.object(prophet, "__version__", version):
+        reqs = mlflow.prophet.get_default_pip_requirements()
+    assert ("pandas<3" in reqs) is bounded
+
+
 def test_model_save_persists_requirements_in_mlflow_model_directory(
     prophet_model, model_path, prophet_custom_env
 ):
@@ -390,7 +414,8 @@ def test_pyfunc_serve_and_score(prophet_model):
     # cast to string representation of datetime series, otherwise will default cast to Unix time
     # which Prophet does not support for encoding
     inference_data = (
-        prophet_model.model.make_future_dataframe(FORECAST_HORIZON)["ds"]
+        prophet_model.model
+        .make_future_dataframe(FORECAST_HORIZON)["ds"]
         .dt.strftime(INFER_FORMAT)
         .to_frame(name="ds")
     )

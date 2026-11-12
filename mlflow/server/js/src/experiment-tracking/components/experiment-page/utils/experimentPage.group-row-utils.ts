@@ -1,24 +1,43 @@
-import { compact, entries, isObject, isNil, isUndefined, reject, values, Dictionary } from 'lodash';
+import type { Dictionary } from 'lodash';
+import { compact, entries, isObject, isNil, isUndefined, reject, values } from 'lodash';
+import type { RunGroupByGroupingValue, RunGroupByValueType } from './experimentPage.row-types';
 import {
   type RowGroupRenderMetadata,
   type RowRenderMetadata,
   type RunGroupParentInfo,
   RunGroupingAggregateFunction,
   RunGroupingMode,
-  RunGroupByGroupingValue,
   RunRowVisibilityControl,
 } from './experimentPage.row-types';
 import type { SingleRunData } from './experimentPage.row-utils';
 import type { MetricEntity, RunDatasetWithTags } from '../../../types';
 import type { SampledMetricsByRun } from '@mlflow/mlflow/src/experiment-tracking/components/runs-charts/hooks/useSampledMetricHistory';
 import { RUNS_VISIBILITY_MODE } from '../models/ExperimentPageUIState';
-import {
-  shouldEnableToggleIndividualRunsInGroups,
-  shouldUseRunRowsVisibilityMap,
-} from '../../../../common/utils/FeatureUtils';
+import { shouldUseRunRowsVisibilityMap } from '../../../../common/utils/FeatureUtils';
 import { determineIfRowIsHidden } from './experimentPage.common-row-utils';
 import { removeOutliersFromMetricHistory } from '../../runs-charts/components/RunsCharts.common';
 import { type ExperimentPageSearchFacetsState } from '../models/ExperimentPageSearchFacetsState';
+
+/**
+ * Escapes special characters in filter keys (param/tag names).
+ * Handles keys with dots, backticks, and other special characters.
+ */
+const escapeFilterKey = (key: string): string => {
+  // If the key contains special characters, wrap it in backticks
+  if (/[.\s`'/"]/.test(key)) {
+    return `\`${key.replace(/`/g, '``')}\``;
+  }
+  return key;
+};
+
+/**
+ * Escapes special characters in filter values.
+ * Primarily handles single quotes which need to be escaped.
+ */
+const escapeFilterValue = (value: string): string => {
+  // Escape single quotes by doubling them
+  return value.replace(/'/g, "''");
+};
 
 type AggregableParamEntity = { key: string; value: string };
 type AggregableMetricEntity = { key: string; value: number; step: number; min?: number; max?: number };
@@ -29,6 +48,13 @@ export type RunsGroupByConfig = {
     mode: RunGroupingMode;
     groupByData: string;
   }[];
+};
+
+export const isGroupedBy = (groupBy: RunsGroupByConfig | null, mode: RunGroupingMode, groupByData: string) => {
+  if (!groupBy) {
+    return false;
+  }
+  return groupBy.groupByKeys.some((key) => key.mode === mode && key.groupByData === groupByData);
 };
 
 /**
@@ -155,23 +181,30 @@ const createGroupRenderMetadataV2 = ({
   rowCounter: { value: number };
   useGroupedValuesInCharts?: boolean;
 }): (RowRenderMetadata | RowGroupRenderMetadata)[] => {
-  const isRunVisible = (runUuid: string) => {
+  const isRunVisible = (runUuid: string, runStatus: string) => {
     if (shouldUseRunRowsVisibilityMap() && !isUndefined(runsVisibilityMap[runUuid])) {
       return runsVisibilityMap[runUuid];
     }
-    return !runsHidden.includes(runUuid);
+    if (runsHidden.includes(runUuid)) {
+      return false;
+    }
+    if (runsHiddenMode === RUNS_VISIBILITY_MODE.HIDE_FINISHED_RUNS) {
+      return !['FINISHED', 'FAILED', 'KILLED'].includes(runStatus);
+    }
+    return true;
   };
 
   // For metric and runs calculation, include only visible runs in the group
   const metricsByRun = runsInGroup
-    .filter(({ runInfo }) => isRunVisible(runInfo.runUuid))
+    .filter(({ runInfo }) => isRunVisible(runInfo.runUuid, runInfo.status))
     .map((run) => run.metrics || []);
-  const paramsByRun = runsInGroup.filter(({ runInfo }) => isRunVisible(runInfo.runUuid)).map((run) => run.params || []);
+  const paramsByRun = runsInGroup
+    .filter(({ runInfo }) => isRunVisible(runInfo.runUuid, runInfo.status))
+    .map((run) => run.params || []);
 
   const isGroupHidden =
     !isRemainingRowsGroup &&
     determineIfRowIsHidden(runsHiddenMode, runsHidden, groupId, rowCounter.value, runsVisibilityMap);
-
   // Increment the counter for "Show N first runs" only if the group is actually visible in charts
   const isGroupUsedInCharts = useGroupedValuesInCharts && !isRemainingRowsGroup;
 
@@ -181,7 +214,7 @@ const createGroupRenderMetadataV2 = ({
 
   const groupVisibilityControl = (() => {
     // If the individual run visibility selection is enabled then we should show the visibility control UI
-    if (shouldEnableToggleIndividualRunsInGroups() && useGroupedValuesInCharts === false) {
+    if (useGroupedValuesInCharts === false) {
       return RunRowVisibilityControl.Enabled;
     }
     // Otherwise, if the group is not used in charts, we should hide the visibility control UI
@@ -194,14 +227,16 @@ const createGroupRenderMetadataV2 = ({
     expanderOpen: expanded,
     aggregateFunction,
     runUuids: runsInGroup.map((run) => run.runInfo.runUuid),
-    runUuidsForAggregation: runsInGroup.map((run) => run.runInfo.runUuid).filter(isRunVisible),
+    runUuidsForAggregation: runsInGroup
+      .map((run) => run.runInfo.runUuid)
+      .filter((uuid, idx) => isRunVisible(uuid, runsInGroup[idx].runInfo.status)),
     aggregatedMetricEntities: aggregateValues(metricsByRun, aggregateFunction),
     aggregatedParamEntities: aggregateValues(paramsByRun, aggregateFunction),
     groupingValues: groupingKeys,
     visibilityControl: groupVisibilityControl,
     isRemainingRunsGroup: isRemainingRowsGroup,
     hidden: isGroupHidden,
-    allRunsHidden: runsInGroup.every((run) => !isRunVisible(run.runInfo.runUuid)),
+    allRunsHidden: runsInGroup.every((run) => !isRunVisible(run.runInfo.runUuid, run.runInfo.status)),
   };
 
   // Create an array for resulting table rows
@@ -215,9 +250,15 @@ const createGroupRenderMetadataV2 = ({
 
         // If the group is not visible in charts, the run row has to determine its own visibility.
         const isRowHidden = !isGroupUsedInCharts
-          ? determineIfRowIsHidden(runsHiddenMode, runsHidden, runInfo.runUuid, rowCounter.value, runsVisibilityMap)
-          : !isRunVisible(runInfo.runUuid);
-
+          ? determineIfRowIsHidden(
+              runsHiddenMode,
+              runsHidden,
+              runInfo.runUuid,
+              rowCounter.value,
+              runsVisibilityMap,
+              runInfo.status,
+            )
+          : !isRunVisible(runInfo.runUuid, runInfo.status);
         // Increment the counter for "Show N first runs" only if the group itself is not visible in charts
         if (!isGroupUsedInCharts) {
           rowCounter.value++;
@@ -345,8 +386,12 @@ const getGroupValueForGroupKey = (runData: SingleRunData, groupKey: RunsGroupByC
 };
 
 export const getRunGroupDisplayName = (group?: RunGroupParentInfo | RowGroupRenderMetadata) => {
-  if (!group || group.isRemainingRunsGroup) {
+  if (!group) {
     return '';
+  }
+
+  if (group.isRemainingRunsGroup) {
+    return 'Unassigned';
   }
 
   if (group.groupingValues.length === 1) {
@@ -660,37 +705,23 @@ export const getGroupedRowRenderMetadata = ({
     // Determine if the group is expanded or not.
     const isGroupExpanded = isUndefined(groupsExpanded[groupId]) || groupsExpanded[groupId] === true;
 
-    if (shouldEnableToggleIndividualRunsInGroups()) {
-      // If the individual run visibility selection is enabled, use specialized version of group rows creation function.
-      result.push(
-        ...createGroupRenderMetadataV2({
-          groupId,
-          expanded: isGroupExpanded,
-          runsInGroup: group.runs,
-          aggregateFunction: groupByConfig.aggregateFunction,
-          isRemainingRowsGroup: false,
-          groupingKeys: group.groupingValues,
-          rowCounter,
-          runsHidden,
-          runsVisibilityMap,
-          runsHiddenMode,
-          useGroupedValuesInCharts,
-        }),
-      );
-
-      return;
-    }
-
     result.push(
-      ...createGroupRenderMetadata(
+      ...createGroupRenderMetadataV2({
         groupId,
-        isGroupExpanded,
-        group.runs,
-        groupByConfig.aggregateFunction,
-        false,
-        group.groupingValues,
-      ),
+        expanded: isGroupExpanded,
+        runsInGroup: group.runs,
+        aggregateFunction: groupByConfig.aggregateFunction,
+        isRemainingRowsGroup: false,
+        groupingKeys: group.groupingValues,
+        rowCounter,
+        runsHidden,
+        runsVisibilityMap,
+        runsHiddenMode,
+        useGroupedValuesInCharts,
+      }),
     );
+
+    return;
   });
 
   // If there are any ungrouped runs, create a group for them as well.
@@ -698,35 +729,21 @@ export const getGroupedRowRenderMetadata = ({
     const groupId = createEmptyGroupId(groupByConfig);
     const isGroupExpanded = groupsExpanded[groupId] === true;
 
-    if (shouldEnableToggleIndividualRunsInGroups()) {
-      // If the individual run visibility selection is enabled, use specialized version of group rows creation function.
-      result.push(
-        ...createGroupRenderMetadataV2({
-          groupId,
-          expanded: isGroupExpanded,
-          runsInGroup: ungroupedRuns,
-          aggregateFunction: groupByConfig.aggregateFunction,
-          isRemainingRowsGroup: true,
-          groupingKeys: [],
-          rowCounter,
-          runsHidden,
-          runsVisibilityMap,
-          runsHiddenMode,
-          useGroupedValuesInCharts,
-        }),
-      );
-    } else {
-      result.push(
-        ...createGroupRenderMetadata(
-          groupId,
-          isGroupExpanded,
-          ungroupedRuns,
-          groupByConfig.aggregateFunction,
-          true,
-          [],
-        ),
-      );
-    }
+    result.push(
+      ...createGroupRenderMetadataV2({
+        groupId,
+        expanded: isGroupExpanded,
+        runsInGroup: ungroupedRuns,
+        aggregateFunction: groupByConfig.aggregateFunction,
+        isRemainingRowsGroup: true,
+        groupingKeys: [],
+        rowCounter,
+        runsHidden,
+        runsVisibilityMap,
+        runsHiddenMode,
+        useGroupedValuesInCharts,
+      }),
+    );
   }
 
   const [entity, sortKey] = extractSortKey(searchFacetsState);
@@ -807,5 +824,70 @@ const extractSortKey = (
   return [undefined, undefined];
 };
 
-export const createSearchFilterFromRunGroupInfo = (groupInfo: RunGroupParentInfo) =>
-  `attributes.run_id IN (${groupInfo.runUuids.map((uuid) => `'${uuid}'`).join(', ')})`;
+/**
+ * Creates a search filter expression from a run group's information.
+ * For groups with valid grouping criteria, generates a filter based on the criteria
+ * (e.g., "params.model_type = 'tree'"). For "Additional runs" groups or groups
+ * with no valid criteria, falls back to filtering by run IDs.
+ */
+export const createSearchFilterFromRunGroupInfo = (groupInfo: RunGroupParentInfo): string => {
+  // Fallback filter that matches runs by their IDs
+  const runIdFilter = `attributes.run_id IN (${groupInfo.runUuids.map((uuid) => `'${uuid}'`).join(', ')})`;
+
+  // For "Additional runs" group (runs without matching group values),
+  // fall back to run ID filter since there's no criteria to filter by
+  if (groupInfo.isRemainingRunsGroup || groupInfo.groupingValues.length === 0) {
+    return runIdFilter;
+  }
+
+  // Build filter expressions from grouping criteria
+  const filterExpressions = groupInfo.groupingValues.map((groupingValue) => {
+    const { mode, groupByData, value } = groupingValue;
+
+    // Handle null/undefined values - runs that don't have this param/tag
+    if (isNil(value)) {
+      // For null values, we need to filter runs where the param/tag doesn't exist
+      // or has no value. This is tricky as backend does not support `IS NULL`.
+      // Fall back to run IDs for this edge case.
+      return null;
+    }
+
+    switch (mode) {
+      case RunGroupingMode.Param:
+        return `params.${escapeFilterKey(groupByData)} = '${escapeFilterValue(String(value))}'`;
+
+      case RunGroupingMode.Tag:
+        return `tags.${escapeFilterKey(groupByData)} = '${escapeFilterValue(String(value))}'`;
+
+      case RunGroupingMode.Dataset:
+        // Dataset value is an object with { name, digest } or a string hash
+        if (typeof value === 'object' && value !== null) {
+          const datasetValue = value as { name: string; digest: string };
+          return `dataset.name = '${escapeFilterValue(datasetValue.name)}' AND dataset.digest = '${escapeFilterValue(datasetValue.digest)}'`;
+        }
+        // Handle legacy string format (hash): "name.digest"
+        // Note: This format comes from getDatasetHash() which creates "name.digest" strings
+        const stringValue = String(value);
+        const lastDotIndex = stringValue.lastIndexOf('.');
+        if (lastDotIndex > 0 && lastDotIndex < stringValue.length - 1) {
+          const name = stringValue.substring(0, lastDotIndex);
+          const digest = stringValue.substring(lastDotIndex + 1);
+          return `dataset.name = '${escapeFilterValue(name)}' AND dataset.digest = '${escapeFilterValue(digest)}'`;
+        }
+        return null;
+
+      default:
+        return null;
+    }
+  });
+
+  // Filter out nulls and join with AND
+  const validExpressions = filterExpressions.filter((expr): expr is string => expr !== null);
+
+  // If no valid expressions could be built, fall back to run IDs
+  if (validExpressions.length === 0) {
+    return runIdFilter;
+  }
+
+  return validExpressions.join(' AND ');
+};

@@ -2,13 +2,14 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any
 from unittest import mock
 
 import opentelemetry.trace as trace_api
 import pytest
 from opentelemetry.sdk.trace import Event, ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import mlflow
 from mlflow.entities import Trace, TraceData, TraceInfo
@@ -18,7 +19,8 @@ from mlflow.ml_package_versions import FLAVOR_TO_MODULE_NAME
 from mlflow.tracing.client import TracingClient
 from mlflow.tracing.constant import TRACE_SCHEMA_VERSION, TRACE_SCHEMA_VERSION_KEY
 from mlflow.tracing.export.inference_table import pop_trace
-from mlflow.tracing.processor.mlflow_v2 import MlflowV2SpanProcessor
+from mlflow.tracing.processor.mlflow_v3 import MlflowV3SpanProcessor
+from mlflow.tracing.processor.otel import OtelSpanProcessor
 from mlflow.tracing.provider import _get_tracer
 from mlflow.tracking.fluent import _get_experiment_id
 from mlflow.utils.autologging_utils import AUTOLOGGING_INTEGRATIONS, get_autolog_function
@@ -30,9 +32,9 @@ def create_mock_otel_span(
     trace_id: int,
     span_id: int,
     name: str = "test_span",
-    parent_id: Optional[int] = None,
-    start_time: Optional[int] = None,
-    end_time: Optional[int] = None,
+    parent_id: int | None = None,
+    start_time: int | None = None,
+    end_time: int | None = None,
 ):
     """
     Create a mock OpenTelemetry span for testing purposes.
@@ -46,7 +48,7 @@ def create_mock_otel_span(
         trace_id: str
         span_id: str
         trace_flags: trace_api.TraceFlags = trace_api.TraceFlags(1)
-        trace_state: trace_api.TraceState = trace_api.TraceState()
+        trace_state: trace_api.TraceState = field(default_factory=trace_api.TraceState)
 
     class _MockOTelSpan(trace_api.Span, ReadableSpan):
         def __init__(
@@ -134,10 +136,26 @@ def create_test_trace_info(
     )
 
 
+def create_test_trace_info_with_uc_table(
+    trace_id: str, catalog_name: str, schema_name: str
+) -> TraceInfo:
+    return TraceInfo(
+        trace_id=trace_id,
+        trace_location=TraceLocation.from_databricks_uc_schema(catalog_name, schema_name),
+        request_time=0,
+        execution_duration=1,
+        state=TraceState.OK,
+        trace_metadata={TRACE_SCHEMA_VERSION_KEY: str(TRACE_SCHEMA_VERSION)},
+        tags={},
+    )
+
+
 def get_traces(experiment_id=None) -> list[Trace]:
+    # Flush any pending async trace writes before querying so tests see complete results.
+    mlflow.flush_trace_async_logging()
     # Get all traces from the backend
     return TracingClient().search_traces(
-        experiment_ids=[experiment_id or _get_experiment_id()],
+        locations=[experiment_id or _get_experiment_id()],
     )
 
 
@@ -153,7 +171,7 @@ def purge_traces(experiment_id=None):
     )
 
 
-def get_tracer_tracking_uri() -> Optional[str]:
+def get_tracer_tracking_uri() -> str | None:
     """Get current tracking URI configured as the trace export destination."""
     from opentelemetry import trace
 
@@ -162,8 +180,8 @@ def get_tracer_tracking_uri() -> Optional[str]:
         tracer = tracer._tracer
     span_processor = tracer.span_processor._span_processors[0]
 
-    if isinstance(span_processor, MlflowV2SpanProcessor):
-        return span_processor._client.tracking_uri
+    if isinstance(span_processor, MlflowV3SpanProcessor):
+        return span_processor.span_exporter._client.tracking_uri
 
 
 @pytest.fixture
@@ -190,7 +208,7 @@ def reset_autolog_state():
     AUTOLOGGING_INTEGRATIONS.clear()
 
 
-def score_in_model_serving(model_uri: str, model_input: dict):
+def score_in_model_serving(model_uri: str, model_input: dict[str, Any]):
     """
     A helper function to emulate model prediction inside a Databricks model serving environment.
 
@@ -211,7 +229,9 @@ def score_in_model_serving(model_uri: str, model_input: dict):
         def _load_model():
             return mlflow.pyfunc.load_model(model_uri)
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="test-tracing-helper"
+        ) as executor:
             model = executor.submit(_load_model).result()
 
         # Score the model
@@ -238,6 +258,22 @@ def skip_module_when_testing_trace_sdk():
             "Skipping test because it requires mlflow or mlflow-skinny to be installed.",
             allow_module_level=True,
         )
+
+
+@pytest.fixture
+def capture_otel_export():
+    """Capture traces in memory for testing otel export."""
+    from mlflow.tracing.provider import provider
+
+    exporter = InMemorySpanExporter()
+    provider.get_or_init_tracer("test")
+    tp = provider.get()
+    processor = OtelSpanProcessor(span_exporter=exporter, export_metrics=False)
+    processor._should_register_traces = False
+    tp.add_span_processor(processor)
+    yield exporter, processor
+    processor.force_flush(timeout_millis=5000)
+    processor.shutdown()
 
 
 V2_TRACE_DICT = {

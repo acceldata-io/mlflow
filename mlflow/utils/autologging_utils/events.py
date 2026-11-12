@@ -132,7 +132,7 @@ class AutologgingEventLogger:
                 f"Received {len(call_args)} positional arguments via `call_args`. `call_args` is"
                 " deprecated in MLflow > 1.13.1, and all arguments should be passed"
                 " in keyword form via `call_kwargs`.",
-                category=DeprecationWarning,
+                category=DeprecationWarning,  # clint: disable=forbidden-deprecation-warning
                 stacklevel=2,
             )
         _logger.debug(
@@ -255,7 +255,7 @@ class AutologgingEventLogger:
         """
         _logger.debug(
             "Original function invocation completed successfully during execution of patched API"
-            " call '%s.%s' for %s autologging. Original function was invoked with with"
+            " call '%s.%s' for %s autologging. Original function was invoked with"
             " args '%s' and kwargs '%s'",
             patch_obj,
             function_name,

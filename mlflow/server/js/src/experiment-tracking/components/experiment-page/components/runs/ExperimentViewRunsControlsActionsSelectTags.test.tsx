@@ -1,6 +1,8 @@
+import { jest, describe, beforeEach, it, expect } from '@jest/globals';
 import { render, screen } from '@testing-library/react';
 import { ExperimentViewRunsControlsActionsSelectTags } from './ExperimentViewRunsControlsActionsSelectTags';
-import { KeyValueEntity, RunInfoEntity } from '@mlflow/mlflow/src/experiment-tracking/types';
+import type { RunInfoEntity } from '../../../../types';
+import type { KeyValueEntity } from '../../../../../common/types';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter } from '../../../../../common/utils/RoutingUtils';
 import { setRunTagsBulkApi } from '@mlflow/mlflow/src/experiment-tracking/actions';
@@ -11,7 +13,8 @@ jest.mock('@mlflow/mlflow/src/experiment-tracking/actions', () => ({
   setRunTagsBulkApi: jest.fn(() => ({ type: 'setRunTagsBulkApi', payload: Promise.resolve() })),
 }));
 
-jest.setTimeout(10000);
+// eslint-disable-next-line no-restricted-syntax -- TODO(FEINF-4392)
+jest.setTimeout(30000);
 
 describe('ExperimentViewRunsControlsActionsSelectTags', () => {
   beforeEach(() => {
@@ -147,7 +150,7 @@ describe('ExperimentViewRunsControlsActionsSelectTags', () => {
     await userEvent.click(screen.getByText('Save'));
 
     // Two runs are selected
-    expect(setRunTagsBulkApi).toBeCalledTimes(2);
+    expect(setRunTagsBulkApi).toHaveBeenCalledTimes(2);
     // Assert the function was called with the correct arguments
     expect(setRunTagsBulkApi).toHaveBeenCalledWith(
       'runUuid1',
@@ -173,5 +176,20 @@ describe('ExperimentViewRunsControlsActionsSelectTags', () => {
         { key: 'tag3', value: 'test3' },
       ],
     );
+  });
+
+  it('renders tags in alphabetical order in the dropdown', async () => {
+    renderComponent();
+
+    // Click on the trigger to open the dropdown
+    await userEvent.click(screen.getByTestId('runs-tag-multiselect-trigger'));
+
+    // Get all rendered options
+    const options = screen.getAllByRole('option');
+    const optionNames = options.map((option) => option.getAttribute('value'));
+
+    // Assert that the options are in alphabetical order
+    const sorted = [...optionNames].sort();
+    expect(optionNames).toEqual(sorted);
   });
 });

@@ -1,17 +1,27 @@
-import type { KeyValueEntity, RunDatasetWithTags, RunInfoEntity } from '../../../types';
+import type { RunDatasetWithTags, RunInfoEntity } from '../../../types';
+import type { KeyValueEntity } from '../../../../common/types';
 import { Button, DropdownMenu, Typography, useDesignSystemTheme } from '@databricks/design-system';
 import { ExperimentViewDatasetWithContext } from '../../experiment-page/components/runs/ExperimentViewDatasetWithContext';
 import { useState } from 'react';
-import {
-  DatasetWithRunType,
-  ExperimentViewDatasetDrawer,
-} from '../../experiment-page/components/runs/ExperimentViewDatasetDrawer';
+import type { DatasetWithRunType } from '../../experiment-page/components/runs/ExperimentViewDatasetDrawer';
+import { ExperimentViewDatasetDrawer } from '../../experiment-page/components/runs/ExperimentViewDatasetDrawer';
 import type { UseGetRunQueryResponseRunInfo } from '../hooks/useGetRunQuery';
+import { DatasetLink } from '../../../pages/experiment-evaluation-datasets/DatasetLink';
+import { parseJSONSafe } from '../../../../common/utils/TagUtils';
 
 /**
  * Renders single dataset, either in overview table cell or within a dropdown
  */
 const DatasetEntry = ({ dataset, onClick }: { dataset: RunDatasetWithTags; onClick: () => void }) => {
+  const content = <ExperimentViewDatasetWithContext datasetWithTags={dataset} displayTextAsLink css={{ margin: 0 }} />;
+
+  // Evaluation datasets carry a dataset_id in their source and have no schema/profile to show in
+  // the drawer, so link straight to the dataset detail page (reusing the eval-runs DatasetLink)
+  // instead of opening an empty drawer. Other dataset types keep the drawer.
+  if (parseJSONSafe(dataset.dataset.source)?.dataset_id) {
+    return <DatasetLink dataset={dataset.dataset}>{content}</DatasetLink>;
+  }
+
   return (
     <Typography.Link
       componentId="codegen_mlflow_app_src_experiment-tracking_components_run-page_overview_runviewdatasetbox.tsx_16"
@@ -21,7 +31,7 @@ const DatasetEntry = ({ dataset, onClick }: { dataset: RunDatasetWithTags; onCli
       }}
       onClick={onClick}
     >
-      <ExperimentViewDatasetWithContext datasetWithTags={dataset} displayTextAsLink css={{ margin: 0 }} />
+      {content}
     </Typography.Link>
   );
 };

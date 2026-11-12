@@ -1,7 +1,7 @@
-import { IntlShape } from 'react-intl';
+import type { IntlShape } from 'react-intl';
 import { saveAs } from 'file-saver';
-import { ExperimentEntity } from '../../../types';
-import { ExperimentRunsSelectorResult } from './experimentRuns.selector';
+import type { ExperimentEntity } from '../../../types';
+import type { ExperimentRunsSelectorResult } from './experimentRuns.selector';
 import { chartDataToCsv, chartMetricHistoryToCsv, runInfosToCsv } from '../../../utils/CsvUtils';
 import type { RunsChartsRunData } from '../../runs-charts/components/RunsCharts.common';
 
@@ -16,6 +16,13 @@ const MLFLOW_NOTEBOOK_TYPE = 'NOTEBOOK';
 const MLFLOW_EXPERIMENT_TYPE = 'MLFLOW_EXPERIMENT';
 
 const EXPERIMENT_TYPE_TAG = 'mlflow.experimentType';
+const EXPERIMENT_SOURCE_TYPE_TAG = 'mlflow.experiment.sourceType';
+const EXPERIMENT_SOURCE_ID_TAG = 'mlflow.experiment.sourceId';
+export const EXPERIMENT_IS_GATEWAY_TAG = 'mlflow.experiment.isGateway';
+
+enum ExperimentSourceType {
+  REPO_NOTEBOOK = 'REPO_NOTEBOOK',
+}
 
 /**
  * Function that gets the experiment type for a given experiment object
@@ -43,11 +50,37 @@ export const isExperimentTypeNotebook = (experiment: ExperimentEntity) =>
   hasExperimentType(experiment, MLFLOW_NOTEBOOK_TYPE);
 
 /**
- * Function that checks if experiment's allowed actions include
- * modification. TODO: fix typo in the const name.
+ * Returns true when the server included an `allowedActions` restriction list.
  */
-export const canModifyExperiment = (experiment: ExperimentEntity) =>
-  (experiment.allowedActions || []).includes('MODIFIY_PERMISSION');
+const hasAllowedActionsRestriction = (experiment: ExperimentEntity) => experiment.allowedActions !== undefined;
+
+const hasAllowedAction = (experiment: ExperimentEntity, action: string) =>
+  !hasAllowedActionsRestriction(experiment) || (experiment.allowedActions || []).includes(action);
+
+/**
+ * Returns whether experiment metadata can be modified.
+ *
+ * Note that `allowedActions === undefined` is treated as unrestricted because the backend did
+ * not provide an explicit restriction list. The `MODIFIY_PERMISSION` action name intentionally
+ * preserves the existing backend typo.
+ */
+export const canModifyExperiment = (experiment: ExperimentEntity) => hasAllowedAction(experiment, 'MODIFIY_PERMISSION');
+
+export const canRenameExperiment = (experiment: ExperimentEntity) => hasAllowedAction(experiment, 'RENAME');
+
+export const canDeleteExperiment = (experiment: ExperimentEntity) => hasAllowedAction(experiment, 'DELETE');
+
+/**
+ * Function that gets the experiment source ID for a given experiment object
+ */
+export const getExperimentSourceId = (experiment: ExperimentEntity) =>
+  experiment.tags?.find((tag) => tag.key === EXPERIMENT_SOURCE_ID_TAG)?.value;
+
+/**
+ * Function that checks if experiment comes from repository notebook
+ */
+export const isRepoNotebookExperiment = (experiment: ExperimentEntity) =>
+  experiment.tags?.find((tag) => tag.key === EXPERIMENT_SOURCE_TYPE_TAG)?.value === ExperimentSourceType.REPO_NOTEBOOK;
 
 /**
  * Function used for downloading run data in CSV form.

@@ -2,7 +2,6 @@ import ast
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Union
 
 import sqlalchemy
 import sqlparse
@@ -67,7 +66,7 @@ class Entity:
         ops = numeric_ops if self.is_numeric() else string_ops
         if op not in ops:
             raise MlflowException.invalid_parameter_value(
-                f"Invalid comparison operator for {self}: {op!r}. Expected one of {string_ops}."
+                f"Invalid comparison operator for {self}: {op!r}. Expected one of {ops}."
             )
 
 
@@ -75,10 +74,10 @@ class Entity:
 class Comparison:
     entity: Entity
     op: str
-    value: Union[str, float]
+    value: str | float
 
 
-def parse_filter_string(filter_string: Optional[str]) -> list[Comparison]:
+def parse_filter_string(filter_string: str | None) -> list[Comparison]:
     if not filter_string:
         return []
     try:
@@ -105,7 +104,6 @@ def parse_filter_string(filter_string: Optional[str]) -> list[Comparison]:
             identifier, op, value = non_whitespace_tokens
             entity = Entity.from_str(identifier)
             entity.validate_op(op)
-            value = float(value) if entity.is_numeric() else value.strip("'")
             if entity.is_numeric():
                 value = float(value)
             else:

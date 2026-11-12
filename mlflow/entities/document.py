@@ -1,6 +1,6 @@
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass
@@ -16,10 +16,10 @@ class Document:
 
     page_content: str
     metadata: dict[str, Any] = field(default_factory=dict)
-    id: Optional[str] = None
+    id: str | None = None
 
     @classmethod
-    def from_langchain_document(cls, document):
+    def from_langchain_document(cls, document: Any) -> "Document":
         # older versions of langchain do not have the id attribute
         id = getattr(document, "id", None)
 
@@ -30,7 +30,7 @@ class Document:
         )
 
     @classmethod
-    def from_llama_index_node_with_score(cls, node_with_score):
+    def from_llama_index_node_with_score(cls, node_with_score: Any) -> "Document":
         metadata = {
             "score": node_with_score.get_score(),
             # update after setting score so that it can be
@@ -44,5 +44,5 @@ class Document:
             id=node_with_score.node_id,
         )
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)

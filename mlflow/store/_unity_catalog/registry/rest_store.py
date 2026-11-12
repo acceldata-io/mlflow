@@ -7,16 +7,27 @@ import re
 import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any
 
 import google.protobuf.empty_pb2
+from pydantic import BaseModel
 
 import mlflow
 from mlflow.entities import Run
 from mlflow.entities.logged_model import LoggedModel
 from mlflow.entities.model_registry.prompt import Prompt
-from mlflow.entities.model_registry.prompt_version import PromptVersion
+from mlflow.entities.model_registry.prompt_version import (
+    PromptModelConfig,
+    PromptVersion,
+)
 from mlflow.exceptions import MlflowException, RestException
+from mlflow.prompt.constants import (
+    PROMPT_MODEL_CONFIG_TAG_KEY,
+    PROMPT_TYPE_CHAT,
+    PROMPT_TYPE_TAG_KEY,
+    PROMPT_TYPE_TEXT,
+    RESPONSE_FORMAT_TAG_KEY,
+)
 from mlflow.protos.databricks_pb2 import (
     INTERNAL_ERROR,
     INVALID_PARAMETER_VALUE,
@@ -175,6 +186,14 @@ _logger = logging.getLogger(__name__)
 _DELTA_TABLE = "delta_table"
 _MAX_LINEAGE_DATA_SOURCES = 10
 
+# Model-version dependency type labels emitted by ``get_model_version_dependencies`` and consumed
+# when translating them into the governance ``DependencyList`` on the native create path.
+_DEP_TYPE_VECTOR_INDEX = "DATABRICKS_VECTOR_INDEX"
+_DEP_TYPE_MODEL_ENDPOINT = "DATABRICKS_MODEL_ENDPOINT"
+_DEP_TYPE_UC_FUNCTION = "DATABRICKS_UC_FUNCTION"
+_DEP_TYPE_UC_CONNECTION = "DATABRICKS_UC_CONNECTION"
+_DEP_TYPE_TABLE = "DATABRICKS_TABLE"
+
 # Pre-compiled regex patterns for better performance in search operations
 _CATALOG_PATTERN = re.compile(r"catalog\s*=\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
 _SCHEMA_PATTERN = re.compile(r"schema\s*=\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
@@ -186,7 +205,7 @@ class _CatalogSchemaFilter:
 
     catalog_name: str
     schema_name: str
-    remaining_filter: Optional[str]
+    remaining_filter: str | None
 
 
 def _require_arg_unspecified(arg_name, arg_value, default_values=None, message=None):
@@ -237,9 +256,8 @@ def get_feature_dependencies(model_dir):
     Databricks. In OSS mlflow, the dependencies are always empty ("").
     """
     model = _load_model(model_dir)
-    model_info = model.get_model_info()
     if (
-        model_info.flavors.get("python_function", {}).get("loader_module")
+        model.flavors.get("python_function", {}).get("loader_module")
         == mlflow.models.model._DATABRICKS_FS_LOADER_MODULE
     ):
         raise MlflowException(
@@ -257,7 +275,6 @@ def get_model_version_dependencies(model_dir):
     from mlflow.models.resources import ResourceType
 
     model = _load_model(model_dir)
-    model_info = model.get_model_info()
     dependencies = []
 
     # Try to get model.auth_policy.system_auth_policy.resources. If that is not found or empty,
@@ -273,35 +290,35 @@ def get_model_version_dependencies(model_dir):
             _fetch_langchain_dependency_from_model_resources(
                 databricks_dependencies,
                 ResourceType.VECTOR_SEARCH_INDEX.value,
-                "DATABRICKS_VECTOR_INDEX",
+                _DEP_TYPE_VECTOR_INDEX,
             )
         )
         dependencies.extend(
             _fetch_langchain_dependency_from_model_resources(
                 databricks_dependencies,
                 ResourceType.SERVING_ENDPOINT.value,
-                "DATABRICKS_MODEL_ENDPOINT",
+                _DEP_TYPE_MODEL_ENDPOINT,
             )
         )
         dependencies.extend(
             _fetch_langchain_dependency_from_model_resources(
                 databricks_dependencies,
                 ResourceType.FUNCTION.value,
-                "DATABRICKS_UC_FUNCTION",
+                _DEP_TYPE_UC_FUNCTION,
             )
         )
         dependencies.extend(
             _fetch_langchain_dependency_from_model_resources(
                 databricks_dependencies,
                 ResourceType.UC_CONNECTION.value,
-                "DATABRICKS_UC_CONNECTION",
+                _DEP_TYPE_UC_CONNECTION,
             )
         )
         dependencies.extend(
             _fetch_langchain_dependency_from_model_resources(
                 databricks_dependencies,
                 ResourceType.TABLE.value,
-                "DATABRICKS_TABLE",
+                _DEP_TYPE_TABLE,
             )
         )
     else:
@@ -313,15 +330,14 @@ def get_model_version_dependencies(model_dir):
         _DATABRICKS_CHAT_ENDPOINT_NAME_KEY = "databricks_chat_endpoint_name"
         _DB_DEPENDENCY_KEY = "databricks_dependency"
 
-        databricks_dependencies = model_info.flavors.get("langchain", {}).get(
-            _DB_DEPENDENCY_KEY, {}
-        )
+        databricks_dependencies = model.flavors.get("langchain", {}).get(_DB_DEPENDENCY_KEY, {})
 
         index_names = _fetch_langchain_dependency_from_model_info(
             databricks_dependencies, _DATABRICKS_VECTOR_SEARCH_INDEX_NAME_KEY
         )
-        for index_name in index_names:
-            dependencies.append({"type": "DATABRICKS_VECTOR_INDEX", "name": index_name})
+        dependencies.extend(
+            {"type": _DEP_TYPE_VECTOR_INDEX, "name": index_name} for index_name in index_names
+        )
         for key in (
             _DATABRICKS_EMBEDDINGS_ENDPOINT_NAME_KEY,
             _DATABRICKS_LLM_ENDPOINT_NAME_KEY,
@@ -330,8 +346,10 @@ def get_model_version_dependencies(model_dir):
             endpoint_names = _fetch_langchain_dependency_from_model_info(
                 databricks_dependencies, key
             )
-            for endpoint_name in endpoint_names:
-                dependencies.append({"type": "DATABRICKS_MODEL_ENDPOINT", "name": endpoint_name})
+            dependencies.extend(
+                {"type": _DEP_TYPE_MODEL_ENDPOINT, "name": endpoint_name}
+                for endpoint_name in endpoint_names
+            )
     return dependencies
 
 
@@ -362,6 +380,7 @@ class UcModelRegistryStore(BaseRestStore):
 
     def __init__(self, store_uri, tracking_uri):
         super().__init__(get_host_creds=functools.partial(get_databricks_host_creds, store_uri))
+        self.store_uri = store_uri
         self.tracking_uri = tracking_uri
         self.get_tracking_host_creds = functools.partial(get_databricks_host_creds, tracking_uri)
         try:
@@ -508,7 +527,7 @@ class UcModelRegistryStore(BaseRestStore):
             UpdateRegisteredModelRequest(
                 name=full_name,
                 description=description,
-                deployment_job_id=str(deployment_job_id) if deployment_job_id else None,
+                deployment_job_id=str(deployment_job_id) if deployment_job_id is not None else None,
             )
         )
         response_proto = self._call_endpoint(UpdateRegisteredModelRequest, req_body)
@@ -866,7 +885,7 @@ class UcModelRegistryStore(BaseRestStore):
                     f"Unable to download model artifacts from source artifact location "
                     f"'{source}' in order to upload them to Unity Catalog. Please ensure "
                     f"the source artifact location exists and that you can download from "
-                    f"it via mlflow.artifacts.download_artifacts()"
+                    f"it via mlflow.artifacts.download_artifacts(). Original error: {e}"
                 ) from e
             try:
                 yield local_model_dir
@@ -881,11 +900,168 @@ class UcModelRegistryStore(BaseRestStore):
                 if not os.path.exists(source) and not is_fuse_or_uc_volumes_uri(local_model_dir):
                     shutil.rmtree(local_model_dir)
 
-    def _get_logged_model_from_model_id(self, model_id) -> Optional[LoggedModel]:
-        # load the MLflow LoggedModel by model_id and
+    def _get_logged_model_from_model_id(self, model_id) -> LoggedModel | None:
         if model_id is None:
             return None
-        return mlflow.get_logged_model(model_id)
+        try:
+            return mlflow.get_logged_model(model_id)
+        except MlflowException as e:
+            # model_id may be from a different workspace that's not accessible,
+            # e.g., during cross-workspace model copying
+            if e.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST):
+                _logger.debug(
+                    f"Could not find logged model with ID {model_id}. "
+                    "This may occur during cross-workspace model copying."
+                )
+                return None
+            raise
+
+    def _create_model_version_with_optional_signature_validation(
+        self,
+        name,
+        source,
+        run_id=None,
+        tags=None,
+        run_link=None,
+        description=None,
+        local_model_path=None,
+        model_id: str | None = None,
+        bypass_signature_validation: bool = False,
+        source_workspace_id: str | None = None,
+    ):
+        """
+        Private method to create a new model version from given source and run ID, with optional
+        bypass of signature validation. This bypass is currently only used by the
+        DatabricksWorkspaceModelRegistryRestStore to migrate model versions from the Databricks
+        workspace registry to Unity Catalog via copy_model_version. We do not want to allow
+        normal use of create_model_version to bypass signature validation, so we have this
+        private method.
+
+        Args:
+            name: Registered model name.
+            source: URI indicating the location of the model artifacts.
+            run_id: Run ID from MLflow tracking server that generated the model.
+            tags: A list of :py:class:`mlflow.entities.model_registry.ModelVersionTag`
+                instances associated with this model version.
+            run_link: Link to the run from an MLflow tracking server that generated this model.
+            description: Description of the version.
+            local_model_path: Local path to the MLflow model, if it's already accessible on the
+                local filesystem. Can be used by AbstractStores that upload model version files
+                to the model registry to avoid a redundant download from the source location when
+                logging and registering a model via a single
+                mlflow.<flavor>.log_model(..., registered_model_name) call.
+            model_id: The ID of the model (from an Experiment) that is being promoted to a
+                registered model version, if applicable.
+            bypass_signature_validation: Whether to bypass signature validation.
+            source_workspace_id: The workspace ID of the source run. If not provided,
+                it will be fetched from the run headers.
+
+        Returns:
+            A single object of :py:class:`mlflow.entities.model_registry.ModelVersion`
+            created in the backend.
+        """
+        _require_arg_unspecified(arg_name="run_link", arg_value=run_link)
+        model_id_cleared = False
+        if logged_model := self._get_logged_model_from_model_id(model_id):
+            run_id = logged_model.source_run_id
+        elif model_id is not None:
+            # _get_logged_model_from_model_id returned None with a non-None model_id, meaning
+            # mlflow.get_logged_model raised RESOURCE_DOES_NOT_EXIST (e.g. model_id belongs to
+            # another workspace during a cross-workspace copy). Clear model_id so the backend
+            # doesn't attempt to resolve an ID that doesn't exist locally.
+            model_id = None
+            model_id_cleared = True
+        headers, run = self._get_run_and_headers(run_id)
+        if source_workspace_id is None:
+            source_workspace_id = self._get_workspace_id(headers)
+        notebook_id = self._get_notebook_id(run)
+        job_id = self._get_job_id(run)
+        extra_headers = None
+        if notebook_id is not None or job_id is not None:
+            lineage_securable_list = self._get_lineage_input_sources(run)
+            entity_list = []
+            lineage_list = None
+            if notebook_id is not None:
+                notebook_entity = Notebook(id=str(notebook_id))
+                entity_list.append(Entity(notebook=notebook_entity))
+            if job_id is not None:
+                job_run_id = self._get_job_run_id(run)
+                job_entity = Job(id=job_id, job_run_id=job_run_id)
+                entity_list.append(Entity(job=job_entity))
+            if lineage_securable_list is not None:
+                lineage_list = [Lineage(source_securables=lineage_securable_list)]
+            lineage_header_info = LineageHeaderInfo(entities=entity_list, lineages=lineage_list)
+            # Base64-encode the header value to ensure it's valid ASCII,
+            # similar to JWT (see https://stackoverflow.com/a/40347926)
+            header_json = message_to_json(lineage_header_info)
+            header_base64 = base64.b64encode(header_json.encode())
+            extra_headers = {_DATABRICKS_LINEAGE_ID_HEADER: header_base64}
+        full_name = get_full_name_from_sc(name, self.spark)
+        with self._local_model_dir(source, local_model_path) as local_model_dir:
+            if not bypass_signature_validation:
+                self._validate_model_signature(local_model_dir)
+            self._download_model_weights_if_not_saved(local_model_dir)
+            feature_deps = get_feature_dependencies(local_model_dir)
+            other_model_deps = (
+                [] if model_id_cleared else get_model_version_dependencies(local_model_dir)
+            )
+            return self._create_and_finalize_model_version(
+                full_name=full_name,
+                source=source,
+                description=description,
+                run_id=run_id,
+                tags=tags,
+                feature_deps=feature_deps,
+                other_model_deps=other_model_deps,
+                model_id=model_id,
+                source_workspace_id=source_workspace_id,
+                extra_headers=extra_headers,
+                local_model_dir=local_model_dir,
+            )
+
+    def _create_and_finalize_model_version(
+        self,
+        *,
+        full_name,
+        source,
+        description,
+        run_id,
+        tags,
+        feature_deps,
+        other_model_deps,
+        model_id,
+        source_workspace_id,
+        extra_headers,
+        local_model_dir,
+    ):
+        """Create a model version on the backend, upload its files, and finalize it.
+
+        Isolated as an overridable seam so backend-specific stores (e.g. the native UC store) can
+        swap the request/response protos and endpoints without duplicating the shared prep in
+        ``_create_model_version_with_optional_signature_validation`` (signature validation, weight
+        download, dependency/lineage collection).
+        """
+        req_body = message_to_json(
+            CreateModelVersionRequest(
+                name=full_name,
+                source=source,
+                run_id=run_id,
+                description=description,
+                tags=uc_model_version_tag_from_mlflow_tags(tags),
+                run_tracking_server_id=source_workspace_id,
+                feature_deps=feature_deps,
+                model_version_dependencies=other_model_deps,
+                model_id=model_id,
+            )
+        )
+        model_version = self._call_endpoint(
+            CreateModelVersionRequest, req_body, extra_headers=extra_headers
+        ).model_version
+
+        store = self._get_artifact_repo(model_version, full_name)
+        store.log_artifacts(local_dir=local_model_dir, artifact_path="")
+        finalized_mv = self._finalize_model_version(name=full_name, version=model_version.version)
+        return model_version_from_uc_proto(finalized_mv)
 
     def create_model_version(
         self,
@@ -896,7 +1072,7 @@ class UcModelRegistryStore(BaseRestStore):
         run_link=None,
         description=None,
         local_model_path=None,
-        model_id: Optional[str] = None,
+        model_id: str | None = None,
     ):
         """
         Create a new model version from given source and run ID.
@@ -921,81 +1097,46 @@ class UcModelRegistryStore(BaseRestStore):
             A single object of :py:class:`mlflow.entities.model_registry.ModelVersion`
             created in the backend.
         """
-        _require_arg_unspecified(arg_name="run_link", arg_value=run_link)
-        logged_model = self._get_logged_model_from_model_id(model_id)
-        if logged_model:
-            run_id = logged_model.source_run_id
-        headers, run = self._get_run_and_headers(run_id)
-        source_workspace_id = self._get_workspace_id(headers)
-        notebook_id = self._get_notebook_id(run)
-        lineage_securable_list = self._get_lineage_input_sources(run)
-        job_id = self._get_job_id(run)
-        job_run_id = self._get_job_run_id(run)
-        extra_headers = None
-        if notebook_id is not None or job_id is not None:
-            entity_list = []
-            lineage_list = None
-            if notebook_id is not None:
-                notebook_entity = Notebook(id=str(notebook_id))
-                entity_list.append(Entity(notebook=notebook_entity))
-            if job_id is not None:
-                job_entity = Job(id=job_id, job_run_id=job_run_id)
-                entity_list.append(Entity(job=job_entity))
-            if lineage_securable_list is not None:
-                lineage_list = [Lineage(source_securables=lineage_securable_list)]
-            lineage_header_info = LineageHeaderInfo(entities=entity_list, lineages=lineage_list)
-            # Base64-encode the header value to ensure it's valid ASCII,
-            # similar to JWT (see https://stackoverflow.com/a/40347926)
-            header_json = message_to_json(lineage_header_info)
-            header_base64 = base64.b64encode(header_json.encode())
-            extra_headers = {_DATABRICKS_LINEAGE_ID_HEADER: header_base64}
-        full_name = get_full_name_from_sc(name, self.spark)
-        with self._local_model_dir(source, local_model_path) as local_model_dir:
-            self._validate_model_signature(local_model_dir)
-            self._download_model_weights_if_not_saved(local_model_dir)
-            feature_deps = get_feature_dependencies(local_model_dir)
-            other_model_deps = get_model_version_dependencies(local_model_dir)
-            req_body = message_to_json(
-                CreateModelVersionRequest(
-                    name=full_name,
-                    source=source,
-                    run_id=run_id,
-                    description=description,
-                    tags=uc_model_version_tag_from_mlflow_tags(tags),
-                    run_tracking_server_id=source_workspace_id,
-                    feature_deps=feature_deps,
-                    model_version_dependencies=other_model_deps,
-                    model_id=model_id,
-                )
-            )
-            model_version = self._call_endpoint(
-                CreateModelVersionRequest, req_body, extra_headers=extra_headers
-            ).model_version
+        return self._create_model_version_with_optional_signature_validation(
+            name=name,
+            source=source,
+            run_id=run_id,
+            tags=tags,
+            run_link=run_link,
+            description=description,
+            local_model_path=local_model_path,
+            model_id=model_id,
+            bypass_signature_validation=False,
+        )
 
-            store = self._get_artifact_repo(model_version, full_name)
-            store.log_artifacts(local_dir=local_model_dir, artifact_path="")
-            finalized_mv = self._finalize_model_version(
-                name=full_name, version=model_version.version
-            )
-            return model_version_from_uc_proto(finalized_mv)
+    def _get_artifact_repo(self, model_version, model_name=None, storage_location=None):
+        # The native model-version proto has no `name` field, so the caller supplies the full
+        # catalog.schema.model name via `model_name`; fall back to `model_version.name` for the
+        # legacy proto, which carries it directly.
+        version = model_version.version
+        credential_name = model_name if model_name is not None else model_version.name
 
-    def _get_artifact_repo(self, model_version, model_name=None):
         def base_credential_refresh_def():
             return self._get_temporary_model_version_write_credentials(
-                name=model_version.name, version=model_version.version
+                name=credential_name, version=version
             )
 
         if is_databricks_sdk_models_artifact_repository_enabled(self.get_host_creds()):
-            return DatabricksSDKModelsArtifactRepository(model_name, model_version.version)
-
-        scoped_token = base_credential_refresh_def()
-        if scoped_token.storage_mode == StorageMode.DEFAULT_STORAGE:
-            return PresignedUrlArtifactRepository(
-                self.get_host_creds(), model_version.name, model_version.version
+            return DatabricksSDKModelsArtifactRepository(
+                credential_name, version, registry_uri=self.store_uri
             )
 
+        resolved_storage_location = (
+            storage_location
+            if storage_location is not None
+            else getattr(model_version, "storage_location", None)
+        )
+        scoped_token = base_credential_refresh_def()
+        if scoped_token.storage_mode == StorageMode.DEFAULT_STORAGE:
+            return PresignedUrlArtifactRepository(self.get_host_creds(), credential_name, version)
+
         return get_artifact_repo_from_storage_info(
-            storage_location=model_version.storage_location,
+            storage_location=resolved_storage_location,
             scoped_token=scoped_token,
             base_credential_refresh_def=base_credential_refresh_def,
         )
@@ -1219,8 +1360,8 @@ class UcModelRegistryStore(BaseRestStore):
     def create_prompt(
         self,
         name: str,
-        description: Optional[str] = None,
-        tags: Optional[dict[str, str]] = None,
+        description: str | None = None,
+        tags: dict[str, str] | None = None,
     ) -> Prompt:
         """
         Create a new prompt in Unity Catalog (metadata only, no initial version).
@@ -1244,10 +1385,10 @@ class UcModelRegistryStore(BaseRestStore):
 
     def search_prompts(
         self,
-        filter_string: Optional[str] = None,
-        max_results: Optional[int] = None,
-        order_by: Optional[list[str]] = None,
-        page_token: Optional[str] = None,
+        filter_string: str | None = None,
+        max_results: int | None = None,
+        order_by: list[str] | None = None,
+        page_token: str | None = None,
     ) -> PagedList[Prompt]:
         """
         Search for prompts in Unity Catalog.
@@ -1261,6 +1402,7 @@ class UcModelRegistryStore(BaseRestStore):
         """
         # Parse catalog and schema from filter string
         if filter_string:
+            filter_string = self._parse_experiment_id_filter(filter_string)
             parsed_filter = self._parse_catalog_schema_from_filter(filter_string)
         else:
             raise MlflowException(
@@ -1283,16 +1425,15 @@ class UcModelRegistryStore(BaseRestStore):
         )
 
         response_proto = self._call_endpoint(SearchPromptsRequest, req_body)
-        prompts = []
-        for prompt_info in response_proto.prompts:
-            # For UC, only use the basic prompt info without extra tag fetching
-            prompts.append(proto_info_to_mlflow_prompt_info(prompt_info, {}))
+        # For UC, only use the basic prompt info without extra tag fetching
+        prompts = [
+            proto_info_to_mlflow_prompt_info(prompt_info, {})
+            for prompt_info in response_proto.prompts
+        ]
 
         return PagedList(prompts, response_proto.next_page_token)
 
-    def _parse_catalog_schema_from_filter(
-        self, filter_string: Optional[str]
-    ) -> _CatalogSchemaFilter:
+    def _parse_catalog_schema_from_filter(self, filter_string: str | None) -> _CatalogSchemaFilter:
         """
         Parse catalog and schema from filter string for Unity Catalog using regex.
 
@@ -1391,7 +1532,7 @@ class UcModelRegistryStore(BaseRestStore):
             proto_name=DeletePromptTagRequest,
         )
 
-    def get_prompt(self, name: str) -> Optional[Prompt]:
+    def get_prompt(self, name: str) -> Prompt | None:
         """
         Get prompt by name from Unity Catalog.
         """
@@ -1416,9 +1557,11 @@ class UcModelRegistryStore(BaseRestStore):
     def create_prompt_version(
         self,
         name: str,
-        template: str,
-        description: Optional[str] = None,
-        tags: Optional[dict[str, str]] = None,
+        template: str | list[dict[str, Any]],
+        description: str | None = None,
+        tags: dict[str, str] | None = None,
+        response_format: type[BaseModel] | dict[str, Any] | None = None,
+        model_config: "PromptModelConfig | dict[str, Any] | None" = None,
     ) -> PromptVersion:
         """
         Create a new prompt version in Unity Catalog.
@@ -1433,8 +1576,27 @@ class UcModelRegistryStore(BaseRestStore):
         # We don't set it here as it's generated server-side
         if description:
             prompt_version_proto.description = description
-        if tags:
-            prompt_version_proto.tags.extend(mlflow_tags_to_proto_version_tags(tags))
+
+        final_tags = tags.copy() if tags else {}
+        if response_format:
+            final_tags[RESPONSE_FORMAT_TAG_KEY] = json.dumps(
+                PromptVersion.convert_response_format_to_dict(response_format)
+            )
+        if model_config:
+            # Convert ModelConfig to dict if needed
+            if isinstance(model_config, PromptModelConfig):
+                config_dict = model_config.to_dict()
+            else:
+                config_dict = model_config
+
+            final_tags[PROMPT_MODEL_CONFIG_TAG_KEY] = json.dumps(config_dict)
+        if isinstance(template, str):
+            final_tags[PROMPT_TYPE_TAG_KEY] = PROMPT_TYPE_TEXT
+        else:
+            final_tags[PROMPT_TYPE_TAG_KEY] = PROMPT_TYPE_CHAT
+
+        if final_tags:
+            prompt_version_proto.tags.extend(mlflow_tags_to_proto_version_tags(final_tags))
 
         req_body = message_to_json(
             CreatePromptVersionRequest(
@@ -1452,7 +1614,7 @@ class UcModelRegistryStore(BaseRestStore):
         )
         return proto_to_mlflow_prompt(response_proto)
 
-    def get_prompt_version(self, name: str, version: Union[str, int]) -> Optional[PromptVersion]:
+    def get_prompt_version(self, name: str, version: str | int) -> PromptVersion | None:
         """
         Get a specific prompt version from Unity Catalog.
         """
@@ -1477,7 +1639,7 @@ class UcModelRegistryStore(BaseRestStore):
                 return None
             raise
 
-    def delete_prompt_version(self, name: str, version: Union[str, int]) -> None:
+    def delete_prompt_version(self, name: str, version: str | int) -> None:
         """
         Delete a prompt version from Unity Catalog.
         """
@@ -1494,7 +1656,7 @@ class UcModelRegistryStore(BaseRestStore):
         )
 
     def search_prompt_versions(
-        self, name: str, max_results: Optional[int] = None, page_token: Optional[str] = None
+        self, name: str, max_results: int | None = None, page_token: str | None = None
     ) -> SearchPromptVersionsResponse:
         """
         Search prompt versions for a given prompt name in Unity Catalog.
@@ -1521,9 +1683,7 @@ class UcModelRegistryStore(BaseRestStore):
             proto_name=SearchPromptVersionsRequest,
         )
 
-    def set_prompt_version_tag(
-        self, name: str, version: Union[str, int], key: str, value: str
-    ) -> None:
+    def set_prompt_version_tag(self, name: str, version: str | int, key: str, value: str) -> None:
         """
         Set a tag on a prompt version in Unity Catalog.
         """
@@ -1541,7 +1701,7 @@ class UcModelRegistryStore(BaseRestStore):
             proto_name=SetPromptVersionTagRequest,
         )
 
-    def delete_prompt_version_tag(self, name: str, version: Union[str, int], key: str) -> None:
+    def delete_prompt_version_tag(self, name: str, version: str | int, key: str) -> None:
         """
         Delete a tag from a prompt version in Unity Catalog.
         """
@@ -1559,7 +1719,7 @@ class UcModelRegistryStore(BaseRestStore):
             proto_name=DeletePromptVersionTagRequest,
         )
 
-    def get_prompt_version_by_alias(self, name: str, alias: str) -> Optional[PromptVersion]:
+    def get_prompt_version_by_alias(self, name: str, alias: str) -> PromptVersion | None:
         """
         Get a prompt version by alias from Unity Catalog.
         """
@@ -1584,7 +1744,7 @@ class UcModelRegistryStore(BaseRestStore):
                 return None
             raise
 
-    def set_prompt_alias(self, name: str, alias: str, version: Union[str, int]) -> None:
+    def set_prompt_alias(self, name: str, alias: str, version: str | int) -> None:
         """
         Set an alias for a prompt version in Unity Catalog.
         """
@@ -1661,8 +1821,6 @@ class UcModelRegistryStore(BaseRestStore):
             prompt_versions: List of PromptVersion objects to link.
             trace_id: Trace ID to link to each prompt version.
         """
-        super().link_prompts_to_trace(prompt_versions=prompt_versions, trace_id=trace_id)
-
         prompt_version_entries = [
             PromptVersionLinkEntry(name=pv.name, version=str(pv.version)) for pv in prompt_versions
         ]
@@ -1714,7 +1872,9 @@ class UcModelRegistryStore(BaseRestStore):
         except Exception:
             _logger.debug("Failed to link prompt version to run in unity catalog", exc_info=True)
 
-    def _edit_endpoint_and_call(self, endpoint, method, req_body, proto_name, **kwargs):
+    def _edit_endpoint_and_call(
+        self, endpoint, method, req_body, proto_name, extra_headers=None, **kwargs
+    ):
         """
         Edit endpoint URL with parameters and make the call.
 
@@ -1723,6 +1883,7 @@ class UcModelRegistryStore(BaseRestStore):
             method: HTTP method
             req_body: Request body
             proto_name: Protobuf message class for response
+            extra_headers: Optional extra HTTP headers to send with the request.
             **kwargs: Parameters to substitute in the endpoint template
         """
         # Replace placeholders in endpoint with actual values
@@ -1737,4 +1898,5 @@ class UcModelRegistryStore(BaseRestStore):
             method=method,
             json_body=req_body,
             response_proto=self._get_response_from_method(proto_name),
+            extra_headers=extra_headers,
         )

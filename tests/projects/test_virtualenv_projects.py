@@ -24,9 +24,9 @@ def use_dev_mlflow_for_projects():
     mlflow_root = os.path.dirname(os.path.dirname(mlflow.__file__))
 
     conda_env = read_yaml(TEST_VIRTUALENV_CONDA_PROJECT_DIR, "conda.yaml")
-    conda_pip_dependencies = [
+    conda_pip_dependencies = next(
         item for item in conda_env["dependencies"] if isinstance(item, dict) and "pip" in item
-    ][0]["pip"]
+    )["pip"]
     if "mlflow" in conda_pip_dependencies:
         conda_pip_dependencies.remove("mlflow")
         conda_pip_dependencies.append(mlflow_root)
@@ -47,9 +47,18 @@ def use_dev_mlflow_for_projects():
 
 
 @spy_on_create_virtualenv
-def test_virtualenv_project_execution(create_virtualenv_spy):
+def test_virtualenv_project_execution_virtualenv(create_virtualenv_spy):
     submitted_run = mlflow.projects.run(
         TEST_VIRTUALENV_PROJECT_DIR, entry_point="test", env_manager="virtualenv"
+    )
+    submitted_run.wait()
+    create_virtualenv_spy.assert_called_once()
+
+
+@spy_on_create_virtualenv
+def test_virtualenv_project_execution_uv(create_virtualenv_spy):
+    submitted_run = mlflow.projects.run(
+        TEST_VIRTUALENV_PROJECT_DIR, entry_point="test", env_manager="uv"
     )
     submitted_run.wait()
     create_virtualenv_spy.assert_called_once()

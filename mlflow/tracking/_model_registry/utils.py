@@ -1,7 +1,7 @@
+import importlib
 from functools import partial
-from typing import Optional
 
-from mlflow.environment_variables import MLFLOW_REGISTRY_URI
+from mlflow.environment_variables import MLFLOW_ENABLE_WORKSPACES, MLFLOW_REGISTRY_URI
 from mlflow.store.db.db_types import DATABASE_ENGINES
 from mlflow.store.model_registry.databricks_workspace_model_registry_rest_store import (
     DatabricksWorkspaceModelRegistryRestStore,
@@ -15,7 +15,6 @@ from mlflow.tracking._tracking_service.utils import (
 from mlflow.utils._spark_utils import _get_active_spark_session
 from mlflow.utils.credentials import get_default_host_creds
 from mlflow.utils.databricks_utils import (
-    get_databricks_host_creds,
     is_in_databricks_serverless_runtime,
     warn_on_deprecated_cross_workspace_registry_uri,
 )
@@ -119,7 +118,7 @@ def _get_registry_uri_from_context():
     return _registry_uri
 
 
-def _get_default_registry_uri_for_tracking_uri(tracking_uri: Optional[str]) -> Optional[str]:
+def _get_default_registry_uri_for_tracking_uri(tracking_uri: str | None) -> str | None:
     """
     Get the default registry URI for a given tracking URI.
 
@@ -181,8 +180,8 @@ def get_registry_uri() -> str:
 
 
 def _resolve_registry_uri(
-    registry_uri: Optional[str] = None, tracking_uri: Optional[str] = None
-) -> Optional[str]:
+    registry_uri: str | None = None, tracking_uri: str | None = None
+) -> str | None:
     """
     Resolve the registry URI following the same logic as get_registry_uri().
     """
@@ -195,17 +194,21 @@ def _resolve_registry_uri(
 
 def _get_sqlalchemy_store(store_uri):
     from mlflow.store.model_registry.sqlalchemy_store import SqlAlchemyStore
+    from mlflow.store.model_registry.sqlalchemy_workspace_store import (
+        WorkspaceAwareSqlAlchemyStore,
+    )
 
-    return SqlAlchemyStore(store_uri)
+    store_cls = WorkspaceAwareSqlAlchemyStore if MLFLOW_ENABLE_WORKSPACES.get() else SqlAlchemyStore
+    return store_cls(store_uri)
 
 
 def _get_rest_store(store_uri, **_):
     return RestStore(partial(get_default_host_creds, store_uri))
 
 
-def _get_databricks_rest_store(store_uri, **_):
+def _get_databricks_rest_store(store_uri, tracking_uri, **_):
     warn_on_deprecated_cross_workspace_registry_uri(registry_uri=store_uri)
-    return DatabricksWorkspaceModelRegistryRestStore(partial(get_databricks_host_creds, store_uri))
+    return DatabricksWorkspaceModelRegistryRestStore(store_uri, tracking_uri)
 
 
 # We define the global variable as `None` so that instantiating the store does not lead to circular
@@ -217,9 +220,16 @@ def _get_file_store(store_uri, **_):
     return FileStore(store_uri)
 
 
+def _get_databricks_uc_rest_store(store_uri, tracking_uri, **_):
+    from mlflow.store._unity_catalog.registry.utils import get_uc_model_registry_store_class
+
+    # The native /api/2.1 store and the legacy /api/2.0 store are separate classes; select which
+    # one to instantiate based on MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY.
+    return get_uc_model_registry_store_class()(store_uri, tracking_uri)
+
+
 def _get_store_registry():
     global _model_registry_store_registry
-    from mlflow.store._unity_catalog.registry.rest_store import UcModelRegistryStore
     from mlflow.store._unity_catalog.registry.uc_oss_rest_store import UnityCatalogOssStore
 
     if _model_registry_store_registry is not None:
@@ -227,16 +237,17 @@ def _get_store_registry():
 
     _model_registry_store_registry = ModelRegistryStoreRegistry()
     _model_registry_store_registry.register("databricks", _get_databricks_rest_store)
-    # Register a placeholder function that raises if users pass a registry URI with scheme
-    # "databricks-uc"
-    _model_registry_store_registry.register(_DATABRICKS_UNITY_CATALOG_SCHEME, UcModelRegistryStore)
+    _model_registry_store_registry.register(
+        _DATABRICKS_UNITY_CATALOG_SCHEME, _get_databricks_uc_rest_store
+    )
     _model_registry_store_registry.register(_OSS_UNITY_CATALOG_SCHEME, UnityCatalogOssStore)
 
     for scheme in ["http", "https"]:
         _model_registry_store_registry.register(scheme, _get_rest_store)
 
-    for scheme in DATABASE_ENGINES:
-        _model_registry_store_registry.register(scheme, _get_sqlalchemy_store)
+    if importlib.util.find_spec("sqlalchemy") is not None:
+        for scheme in DATABASE_ENGINES:
+            _model_registry_store_registry.register(scheme, _get_sqlalchemy_store)
 
     for scheme in ["", "file"]:
         _model_registry_store_registry.register(scheme, _get_file_store)

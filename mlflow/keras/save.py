@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import Any, Optional
+from typing import Any
 
 import keras
 import yaml
@@ -143,13 +143,11 @@ def save_model(
         import keras
         import mlflow
 
-        model = keras.Sequential(
-            [
-                keras.Input([28, 28, 3]),
-                keras.layers.Flatten(),
-                keras.layers.Dense(2),
-            ]
-        )
+        model = keras.Sequential([
+            keras.Input([28, 28, 3]),
+            keras.layers.Flatten(),
+            keras.layers.Dense(2),
+        ])
         with mlflow.start_run() as run:
             mlflow.keras.save_model(model, "./model")
     """
@@ -276,7 +274,7 @@ def save_model(
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
 def log_model(
     model,
-    artifact_path: Optional[str] = None,
+    artifact_path: str | None = None,
     save_exported_model=False,
     conda_env=None,
     signature: ModelSignature = None,
@@ -287,12 +285,12 @@ def log_model(
     extra_pip_requirements=None,
     save_model_kwargs=None,
     metadata=None,
-    name: Optional[str] = None,
-    params: Optional[dict[str, Any]] = None,
-    tags: Optional[dict[str, Any]] = None,
-    model_type: Optional[str] = None,
+    name: str | None = None,
+    params: dict[str, Any] | None = None,
+    tags: dict[str, Any] | None = None,
+    model_type: str | None = None,
     step: int = 0,
-    model_id: Optional[str] = None,
+    model_id: str | None = None,
 ):
     """
     Log a Keras model along with metadata to MLflow.
@@ -336,13 +334,11 @@ def log_model(
         import keras
         import mlflow
 
-        model = keras.Sequential(
-            [
-                keras.Input([28, 28, 3]),
-                keras.layers.Flatten(),
-                keras.layers.Dense(2),
-            ]
-        )
+        model = keras.Sequential([
+            keras.Input([28, 28, 3]),
+            keras.layers.Flatten(),
+            keras.layers.Dense(2),
+        ])
         with mlflow.start_run() as run:
             mlflow.keras.log_model(model, name="model")
     """

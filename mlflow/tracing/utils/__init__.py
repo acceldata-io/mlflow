@@ -5,22 +5,29 @@ import inspect
 import json
 import logging
 import uuid
-from collections import Counter
+from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import asdict, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Generator
 
+import pydantic
 from opentelemetry import trace as trace_api
+from opentelemetry.sdk.trace import ReadableSpan as OTelReadableSpan
 from opentelemetry.sdk.trace import Span as OTelSpan
-from packaging.version import Version
 
-from mlflow.exceptions import BAD_REQUEST, MlflowTracingException
+from mlflow.exceptions import BAD_REQUEST, MlflowException, MlflowTracingException
 from mlflow.tracing.constant import (
+    ASSESSMENT_ID_PREFIX,
+    TRACE_ID_V4_PREFIX,
     TRACE_REQUEST_ID_PREFIX,
     SpanAttributeKey,
     TokenUsageKey,
     TraceMetadataKey,
+    TraceSizeStatsKey,
+)
+from mlflow.tracing.constant import (
+    CostKey as CostKey,
 )
 from mlflow.utils.mlflow_tags import IMMUTABLE_TAGS
 from mlflow.version import IS_TRACING_SDK_ONLY
@@ -32,10 +39,10 @@ SPANS_COLUMN_NAME = "spans"
 if TYPE_CHECKING:
     from mlflow.entities import LiveSpan, Trace
     from mlflow.pyfunc.context import Context
-    from mlflow.types.chat import ChatMessage, ChatTool
+    from mlflow.types.chat import ChatTool
 
 
-def capture_function_input_args(func, args, kwargs) -> Optional[dict[str, Any]]:
+def capture_function_input_args(func, args, kwargs) -> dict[str, Any] | None:
     try:
         func_signature = inspect.signature(func)
         bound_arguments = func_signature.bind(*args, **kwargs)
@@ -66,39 +73,21 @@ class TraceJSONEncoder(json.JSONEncoder):
     """
 
     def default(self, obj):
-        try:
-            import langchain
-
-            # LangChain < 0.3.0 does some trick to support Pydantic 1.x and 2.x, so checking
-            # type with installed Pydantic version might not work for some models.
-            # https://github.com/langchain-ai/langchain/blob/b66a4f48fa5656871c3e849f7e1790dfb5a4c56b/libs/core/langchain_core/pydantic_v1/__init__.py#L7
-            if Version(langchain.__version__) < Version("0.3.0"):
-                from langchain_core.pydantic_v1 import BaseModel as LangChainBaseModel
-
-                if isinstance(obj, LangChainBaseModel):
-                    return obj.dict()
-        except ImportError:
-            pass
-
-        try:
-            import pydantic
-
-            if isinstance(obj, pydantic.BaseModel):
-                # NB: Pydantic 2.0+ has a different API for model serialization
-                if Version(pydantic.VERSION) >= Version("2.0"):
-                    return obj.model_dump()
-                else:
-                    return obj.dict()
-        except ImportError:
-            pass
+        if isinstance(obj, pydantic.BaseModel):
+            return obj.model_dump()
 
         # Some dataclass object defines __str__ method that doesn't return the full object
         # representation, so we use dict representation instead.
         # E.g. https://github.com/run-llama/llama_index/blob/29ece9b058f6b9a1cf29bc723ed4aa3a39879ad5/llama-index-core/llama_index/core/chat_engine/types.py#L63-L64
         if is_dataclass(obj):
+            # Use shallow field extraction instead of asdict() to avoid copy.deepcopy(),
+            # which can leave partially-constructed objects (e.g. AsyncHttpxClientWrapper
+            # missing _state) that crash during garbage collection.
+            # json.dumps will recursively call default() on nested values, so we still
+            # get full recursive serialization without the deepcopy hazard.
             try:
-                return asdict(obj)
-            except TypeError:
+                return {f.name: getattr(obj, f.name) for f in fields(obj)}
+            except Exception:
                 pass
 
         # Some object has dangerous side effect in __str__ method, so we use class name instead.
@@ -133,6 +122,34 @@ class TraceJSONEncoder(json.JSONEncoder):
         return True
 
 
+def dump_span_attribute_value(value: Any) -> str:
+    # NB: OpenTelemetry attribute can store not only string but also a few primitives like
+    #   int, float, bool, and list of them. However, we serialize all into JSON string here
+    #   for the simplicity in deserialization process.
+    try:
+        return json.dumps(value, cls=TraceJSONEncoder, ensure_ascii=False)
+    except (ValueError, TypeError) as e:
+        # `json.dumps` raises `ValueError: Circular reference detected` for self-referencing
+        # objects (e.g. pydantic_ai's `run_context`) and `TypeError` for unsupported
+        # structures such as dictionaries with non-serializable keys (e.g. `frozenset`).
+        # Fall back to a repr-based dump so the span attribute is still set and tracing
+        # doesn't crash the user's workflow.
+        _logger.debug(
+            "Failed to serialize span attribute value due to %s. Falling back to repr. ",
+            type(e).__name__,
+            exc_info=True,
+        )
+        return json.dumps(repr(value), ensure_ascii=False)
+
+
+def try_json_loads(value: Any) -> Any:
+    """Try to parse a value as JSON, returning the original value on failure."""
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
+
 @lru_cache(maxsize=1)
 def encode_span_id(span_id: int) -> str:
     """
@@ -159,6 +176,17 @@ def decode_id(span_or_trace_id: str) -> int:
     return int(span_or_trace_id, 16)
 
 
+def get_mlflow_span_for_otel_span(span: OTelSpan) -> LiveSpan | None:
+    """
+    Get the active MLflow span for the given OpenTelemetry span.
+    """
+    from mlflow.tracing.trace_manager import InMemoryTraceManager
+
+    trace_id = get_otel_attribute(span, SpanAttributeKey.REQUEST_ID)
+    mlflow_span_id = encode_span_id(span.get_span_context().span_id)
+    return InMemoryTraceManager.get_instance().get_span_from_id(trace_id, mlflow_span_id)
+
+
 def build_otel_context(trace_id: int, span_id: int) -> trace_api.SpanContext:
     """
     Build an OpenTelemetry SpanContext object from the given trace and span IDs.
@@ -173,66 +201,251 @@ def build_otel_context(trace_id: int, span_id: int) -> trace_api.SpanContext:
     )
 
 
-def deduplicate_span_names_in_place(spans: list[LiveSpan]):
+@dataclass
+class SpanAggregationNode:
+    """Minimal view of a span used for tree-aware aggregation of usage/cost data.
+
+    Allows sharing the aggregation logic between in-memory spans (client) and
+    spans deserialized from a tracking store (server).
     """
-    Deduplicate span names in the trace data by appending an index number to the span name.
 
-    This is only applied when there are multiple spans with the same name. The span names
-    are modified in place to avoid unnecessary copying.
+    span_id: str
+    parent_id: str | None
+    data: dict[str, Any] | None
 
-    E.g.
-        ["red", "red"] -> ["red_1", "red_2"]
-        ["red", "red", "blue"] -> ["red_1", "red_2", "blue"]
+
+def _aggregate_from_nodes(
+    nodes: list[SpanAggregationNode],
+    keys: list[str],
+    default: int | float,
+    optional_keys: list[str] | None = None,
+) -> dict[str, int | float] | None:
+    """Generic aggregation of data from span nodes using DFS traversal.
+
+    Avoids double-counting by skipping nodes whose ancestors already have the data.
+
+    Trace-level usage (``CHAT_USAGE``) and cost (``LLM_COST``) are produced by two
+    *independent* calls to this function, each deduping on its own attribute. They
+    reconcile for the common leaf-only integrations (direct providers, langchain,
+    llama_index, crewai, autogen, ag2), where usage sits on the same priced LLM spans as
+    cost so both boundaries coincide. They can differ only when a span carries usage but
+    no cost -- a rollup-on-parent integration (e.g. pydantic_ai, dspy, agno) that sets
+    cumulative usage on an unpriced agent/module span; even then a faithful rollup (parent
+    usage == sum of priced leaves) still reconciles. A cache-heavy trace whose cost looks
+    large relative to ``total_tokens`` is a separate token-accounting gap (``total_tokens``
+    excludes cache tokens that cost is priced on), not this aggregation.
 
     Args:
-        spans: A list of spans to deduplicate.
+        nodes: List of span nodes to aggregate from.
+        keys: Keys to aggregate. Always included in the result.
+        default: Default value (0 for int, 0.0 for float) that also determines return type.
+        optional_keys: Additional keys to aggregate. Only included in the result
+            when the key is present in the node data.
+
+    Returns:
+        Aggregated dictionary with the keys, or None if no data found.
     """
-    span_name_counter = Counter(span.name for span in spans)
-    # Apply renaming only for duplicated spans
-    span_name_counter = {name: 1 for name, count in span_name_counter.items() if count > 1}
-    # Add index to the duplicated span names
-    for span in spans:
-        if count := span_name_counter.get(span.name):
-            span_name_counter[span.name] += 1
-            span._span._name = f"{span.name}_{count}"
+    totals: dict[str, int | float] = dict.fromkeys(keys, default)
+    has_data = False
 
+    node_ids = {node.span_id for node in nodes}
+    children_map: defaultdict[str, list[SpanAggregationNode]] = defaultdict(list)
+    roots: list[SpanAggregationNode] = []
 
-def aggregate_usage_from_spans(spans: list[LiveSpan]) -> Optional[dict[str, int]]:
-    """Aggregate token usage information from all spans in the trace."""
-    input_tokens, output_tokens, total_tokens = 0, 0, 0
-    has_usage_data = False
+    for node in nodes:
+        parent_id = node.parent_id
+        if parent_id and parent_id in node_ids:
+            children_map[parent_id].append(node)
+        else:
+            roots.append(node)
 
-    span_id_to_spans = {span.span_id: span for span in spans}
-    for span in spans:
-        # Get usage attribute from span
-        if usage := span.get_attribute(SpanAttributeKey.CHAT_USAGE):
-            # If the parent span is also LLM/Chat span and has the token usage data,
-            # it tracks the same usage data by multiple flavors e.g. LangChain ChatOpenAI
-            # and OpenAI tracing. We should avoid double counting the usage data.
-            if (
-                span.parent_id
-                and (parent_span := span_id_to_spans.get(span.parent_id))
-                and parent_span.get_attribute(SpanAttributeKey.CHAT_USAGE)
-            ):
-                continue
+    # Iterative DFS with an explicit stack, instead of recursion, to avoid overflowing
+    # Python's call stack for deeply nested traces (~1000+ levels). A recursive walk here
+    # used to abort root-span finalization and permanently corrupt the trace.
+    #
+    # Visit order is irrelevant: totals is a sum and has_data an OR (both commutative), and
+    # each node's ancestor_has_data is fixed by its ancestor chain, not by sibling visit
+    # order. So a plain stack (no reversed()) yields identical results.
+    stack: list[tuple[SpanAggregationNode, bool]] = [(root, False) for root in roots]
+    while stack:
+        node, ancestor_has_data = stack.pop()
 
-            input_tokens += usage.get(TokenUsageKey.INPUT_TOKENS, 0)
-            output_tokens += usage.get(TokenUsageKey.OUTPUT_TOKENS, 0)
-            total_tokens += usage.get(TokenUsageKey.TOTAL_TOKENS, 0)
-            has_usage_data = True
+        data = node.data
+        node_has_data = data is not None
 
-    # If none of the spans have token usage data, we shouldn't log token usage metadata.
-    if not has_usage_data:
+        if node_has_data and not ancestor_has_data:
+            for k in keys:
+                totals[k] += data.get(k, default)
+            for k in optional_keys or []:
+                if k in data:
+                    totals[k] = totals.get(k, default) + data[k]
+            has_data = True
+
+        next_ancestor_has_data = ancestor_has_data or node_has_data
+        stack.extend(
+            (child, next_ancestor_has_data) for child in children_map.get(node.span_id, [])
+        )
+
+    if not has_data:
         return None
 
+    return totals
+
+
+def _to_span_nodes(spans: list[LiveSpan], attribute_key: str) -> list[SpanAggregationNode]:
+    return [
+        SpanAggregationNode(
+            span_id=span.span_id,
+            parent_id=span.parent_id,
+            data=span.get_attribute(attribute_key),
+        )
+        for span in spans
+    ]
+
+
+def aggregate_usage_from_spans(spans: list[LiveSpan]) -> dict[str, int] | None:
+    """Aggregate token usage information from all spans in the trace."""
+    return aggregate_usage_from_span_nodes(_to_span_nodes(spans, SpanAttributeKey.CHAT_USAGE))
+
+
+def aggregate_usage_from_span_nodes(nodes: list[SpanAggregationNode]) -> dict[str, int] | None:
+    """Aggregate token usage information from span nodes.
+
+    Used by the tracking store, which rebuilds the span tree from stored rows instead of
+    holding live spans in memory.
+    """
+    return _aggregate_from_nodes(
+        nodes,
+        keys=[TokenUsageKey.INPUT_TOKENS, TokenUsageKey.OUTPUT_TOKENS, TokenUsageKey.TOTAL_TOKENS],
+        default=0,
+        optional_keys=TokenUsageKey.cache_keys(),
+    )
+
+
+def aggregate_cost_from_spans(spans: list[LiveSpan]) -> dict[str, float] | None:
+    """Aggregate cost information from all spans in the trace."""
+    return aggregate_cost_from_span_nodes(_to_span_nodes(spans, SpanAttributeKey.LLM_COST))
+
+
+def aggregate_cost_from_span_nodes(nodes: list[SpanAggregationNode]) -> dict[str, float] | None:
+    """Aggregate cost information from span nodes.
+
+    Used by the tracking store, which rebuilds the span tree from stored rows instead of
+    holding live spans in memory.
+    """
+    return _aggregate_from_nodes(
+        nodes,
+        keys=[CostKey.INPUT_COST, CostKey.OUTPUT_COST, CostKey.TOTAL_COST],
+        default=0.0,
+    )
+
+
+def calculate_span_cost(span: LiveSpan) -> dict[str, float] | None:
+    """Calculate cost for a single span using LiteLLM pricing data.
+
+    Args:
+        span: The span to calculate cost for.
+
+    Returns:
+        Dictionary with input_cost, output_cost, and total_cost in USD,
+        or None if cost cannot be calculated.
+    """
+    model_name = span.get_attribute(SpanAttributeKey.MODEL)
+    usage = span.get_attribute(SpanAttributeKey.CHAT_USAGE)
+    model_provider = span.get_attribute(SpanAttributeKey.MODEL_PROVIDER)
+    return calculate_cost_by_model_and_token_usage(model_name, usage, model_provider)
+
+
+# Model URI prefixes that are internal routing identifiers (not real model names).
+# Cost lookup would never find them in the catalog and just wastes time.
+_SKIP_COST_PREFIXES = ("gateway:/", "endpoints:/")
+
+
+def calculate_cost_by_model_and_token_usage(
+    model_name: str | None, usage: dict[str, int] | None, model_provider: str | None = None
+) -> dict[str, float] | None:
+    if not model_name or not usage:
+        return None
+
+    if model_name.startswith(_SKIP_COST_PREFIXES):
+        return None
+
+    if not model_provider and model_name.startswith(("databricks-", "databricks/")):
+        model_provider = "databricks"
+
+    prompt_tokens = usage.get(TokenUsageKey.INPUT_TOKENS, 0)
+    completion_tokens = usage.get(TokenUsageKey.OUTPUT_TOKENS, 0)
+
+    if prompt_tokens == 0 and completion_tokens == 0:
+        return None
+
+    cache_kwargs = {}
+    if (cached := usage.get(TokenUsageKey.CACHE_READ_INPUT_TOKENS)) is not None:
+        cache_kwargs["cache_read_input_tokens"] = cached
+    if (created := usage.get(TokenUsageKey.CACHE_CREATION_INPUT_TOKENS)) is not None:
+        cache_kwargs["cache_creation_input_tokens"] = created
+
+    try:
+        import litellm
+        from litellm import cost_per_token
+    except ImportError:
+        from mlflow.utils.providers import cost_per_token
+
+        litellm = None
+
+    if litellm is not None:
+        original_suppress = getattr(litellm, "suppress_debug_info")
+
+    try:
+        if litellm is not None:
+            # Suppress litellm debug messages (e.g. "Provider List: ...") unless
+            # MLflow's logger is set to DEBUG level.
+            litellm.suppress_debug_info = not _logger.isEnabledFor(logging.DEBUG)
+
+        # When provider is known, try it first — this is a fast single-provider lookup
+        # and avoids the slower all-provider scan.
+        result = None
+        if model_provider:
+            try:
+                result = cost_per_token(
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    custom_llm_provider=model_provider.lower(),
+                    **cache_kwargs,
+                )
+            except Exception:
+                pass
+
+        # Fallback: try without provider (for litellm this may match by model name alone,
+        # for builtin this scans bundled providers).
+        if result is None:
+            try:
+                result = cost_per_token(
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    **cache_kwargs,
+                )
+            except Exception:
+                pass
+    finally:
+        if litellm is not None:
+            litellm.suppress_debug_info = original_suppress
+
+    if result is None:
+        _logger.debug(f"Failed to calculate cost for model {model_name}")
+        return None
+
+    input_cost_usd, output_cost_usd = result
     return {
-        TokenUsageKey.INPUT_TOKENS: input_tokens,
-        TokenUsageKey.OUTPUT_TOKENS: output_tokens,
-        TokenUsageKey.TOTAL_TOKENS: total_tokens,
+        CostKey.INPUT_COST: input_cost_usd,
+        CostKey.OUTPUT_COST: output_cost_usd,
+        CostKey.TOTAL_COST: input_cost_usd + output_cost_usd,
     }
 
 
-def get_otel_attribute(span: trace_api.Span, key: str) -> Optional[str]:
+def get_otel_attribute(span: trace_api.Span, key: str) -> str | None:
     """
     Get the attribute value from the OpenTelemetry span in a decoded format.
 
@@ -245,7 +458,10 @@ def get_otel_attribute(span: trace_api.Span, key: str) -> Optional[str]:
         be parsed, return None.
     """
     try:
-        return json.loads(span.attributes.get(key))
+        attribute_value = span.attributes.get(key)
+        if attribute_value is None:
+            return None
+        return json.loads(attribute_value)
     except Exception:
         _logger.debug(f"Failed to get attribute {key} with from span {span}.", exc_info=True)
 
@@ -255,13 +471,13 @@ def _try_get_prediction_context():
     #     relies on numpy, which is not installed in skinny.
     try:
         from mlflow.pyfunc.context import get_prediction_context
-    except ImportError:
+    except (ImportError, KeyError):
         return
 
     return get_prediction_context()
 
 
-def maybe_get_request_id(is_evaluate=False) -> Optional[str]:
+def maybe_get_request_id(is_evaluate=False) -> str | None:
     """Get the request ID if the current prediction is as a part of MLflow model evaluation."""
     context = _try_get_prediction_context()
     if not context or (is_evaluate and not context.is_evaluate):
@@ -278,13 +494,36 @@ def maybe_get_request_id(is_evaluate=False) -> Optional[str]:
     return context.request_id
 
 
-def maybe_get_dependencies_schemas() -> Optional[dict]:
-    context = _try_get_prediction_context()
-    if context:
+def maybe_get_serving_request_id() -> str | None:
+    """Best-effort Databricks model-serving client request ID for the current request.
+
+    Reads the request ID from the prediction context, falling back to the ``X-Request-Id`` header
+    for streaming responses where no prediction context is active. Returns ``None`` when there is
+    no request ID rather than aborting, so callers can use it purely to key the serving buffer.
+
+    Returns ``None`` outside model serving, where a client request ID has no meaning.
+    """
+    from mlflow.utils.databricks_utils import is_in_databricks_model_serving_environment
+
+    if not is_in_databricks_model_serving_environment():
+        return None
+
+    if request_id := maybe_get_request_id():
+        return request_id
+
+    from mlflow.tracing.processor.inference_table import _HEADER_REQUEST_ID_KEY, _get_flask_request
+
+    if flask_request := _get_flask_request():
+        return flask_request.headers.get(_HEADER_REQUEST_ID_KEY)
+    return None
+
+
+def maybe_get_dependencies_schemas() -> dict[str, Any] | None:
+    if context := _try_get_prediction_context():
         return context.dependencies_schemas
 
 
-def maybe_get_logged_model_id() -> Optional[str]:
+def maybe_get_logged_model_id() -> str | None:
     """
     Get the logged model ID associated with the current prediction context.
     """
@@ -297,13 +536,54 @@ def exclude_immutable_tags(tags: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in tags.items() if k not in IMMUTABLE_TAGS}
 
 
+def generate_mlflow_trace_id_from_otel_trace_id(otel_trace_id: int) -> str:
+    """
+    Generate an MLflow trace ID from an OpenTelemetry trace ID.
+
+    Args:
+        otel_trace_id: The OpenTelemetry trace ID as an integer.
+
+    Returns:
+        The MLflow trace ID string in format "tr-<hex_trace_id>".
+    """
+    return TRACE_REQUEST_ID_PREFIX + encode_trace_id(otel_trace_id)
+
+
+def generate_trace_id_v4_from_otel_trace_id(otel_trace_id: int, location: str) -> str:
+    """
+    Generate a trace ID in v4 format from the given OpenTelemetry trace ID.
+
+    Args:
+        otel_trace_id: The OpenTelemetry trace ID as an integer.
+        location: The location, of the trace.
+
+    Returns:
+        The MLflow trace ID string in format "trace:/<location>/<hex_trace_id>".
+    """
+    return construct_trace_id_v4(location, encode_trace_id(otel_trace_id))
+
+
+def generate_trace_id_v4(span: OTelSpan, location: str) -> str:
+    """
+    Generate a trace ID for the given span.
+
+    Args:
+        span: The OpenTelemetry span object.
+        location: The location, of the trace.
+
+    Returns:
+        Trace ID with format "trace:/<location>/<hex_trace_id>".
+    """
+    return generate_trace_id_v4_from_otel_trace_id(span.context.trace_id, location)
+
+
 def generate_trace_id_v3(span: OTelSpan) -> str:
     """
     Generate a trace ID for the given span (V3 trace schema).
 
     The format will be "tr-<trace_id>" where the trace_id is hex-encoded Otel trace ID.
     """
-    return TRACE_REQUEST_ID_PREFIX + encode_trace_id(span.context.trace_id)
+    return generate_mlflow_trace_id_from_otel_trace_id(span.context.trace_id)
 
 
 def generate_request_id_v2() -> str:
@@ -333,7 +613,7 @@ def construct_full_inputs(func, *args, **kwargs) -> dict[str, Any]:
 
 
 @contextmanager
-def maybe_set_prediction_context(context: Optional["Context"]):
+def maybe_set_prediction_context(context: "Context" | None):
     """
     Set the prediction context if the given context
     is not None. Otherwise no-op.
@@ -345,66 +625,6 @@ def maybe_set_prediction_context(context: Optional["Context"]):
             yield
     else:
         yield
-
-
-def set_span_chat_messages(
-    span: LiveSpan,
-    messages: list[Union[dict, ChatMessage]],
-    append=False,
-):
-    """
-    Set the `mlflow.chat.messages` attribute on the specified span. This
-    attribute is used in the UI, and also by downstream applications that
-    consume trace data, such as MLflow evaluate.
-
-    Args:
-        span: The LiveSpan to add the attribute to
-        messages: A list of standardized chat messages (refer to the
-                 `spec <../llms/tracing/tracing-schema.html#chat-completion-spans>`_
-                 for details)
-        append: If True, the messages will be appended to the existing messages. Otherwise,
-                the attribute will be overwritten entirely. Default is False.
-                This is useful when you want to record messages incrementally, e.g., log
-                input messages first, and then log output messages later.
-
-    Example:
-
-    .. code-block:: python
-        :test:
-
-        import mlflow
-        from mlflow.tracing import set_span_chat_messages
-
-
-        @mlflow.trace
-        def f():
-            messages = [{"role": "user", "content": "hello"}]
-            span = mlflow.get_current_active_span()
-            set_span_chat_messages(span, messages)
-            return 0
-
-
-        f()
-    """
-    from mlflow.types.chat import ChatMessage
-
-    sanitized_messages = []
-    for message in messages:
-        if isinstance(message, dict):
-            ChatMessage.validate_compat(message)
-            sanitized_messages.append(message)
-        elif isinstance(message, ChatMessage):
-            # NB: ChatMessage is used for both request and response messages. In OpenAI's API spec,
-            #   some fields are only present in either the request or response (e.g., tool_call_id).
-            #   Those fields should not be recorded unless set explicitly, so we set
-            #   exclude_unset=True here to avoid recording unset fields.
-            sanitized_messages.append(message.model_dump_compat(exclude_unset=True))
-
-    if append:
-        existing_messages = span.get_attribute(SpanAttributeKey.CHAT_MESSAGES) or []
-        sanitized_messages = existing_messages + sanitized_messages
-
-    span.set_attribute(SpanAttributeKey.CHAT_MESSAGES, sanitized_messages)
 
 
 def set_span_chat_tools(span: LiveSpan, tools: list[ChatTool]):
@@ -466,61 +686,93 @@ def set_span_chat_tools(span: LiveSpan, tools: list[ChatTool]):
     sanitized_tools = []
     for tool in tools:
         if isinstance(tool, dict):
-            ChatTool.validate_compat(tool)
+            ChatTool.model_validate(tool)
             sanitized_tools.append(tool)
         elif isinstance(tool, ChatTool):
-            sanitized_tools.append(tool.model_dump_compat(exclude_unset=True))
+            sanitized_tools.append(tool.model_dump(exclude_unset=True))
 
     span.set_attribute(SpanAttributeKey.CHAT_TOOLS, sanitized_tools)
 
 
-def set_chat_attributes_special_case(span: LiveSpan, inputs: Any, outputs: Any):
+def _calculate_percentile(sorted_data: list[float], percentile: float) -> float:
     """
-    Set the `mlflow.chat.messages` and `mlflow.chat.tools` attributes on the specified span
-    based on the inputs and outputs of the function.
+    Calculate the percentile value from sorted data.
 
-    Usually those attributes are set by autologging integrations. This utility function handles
-    special cases where we want to set chat attributes for manually created spans via @mlflow.trace
-    decorator, such as ResponsesAgent tracing spans.
+    Args:
+        sorted_data: A sorted list of numeric values
+        percentile: The percentile to calculate (e.g., 0.25 for 25th percentile)
+
+    Returns:
+        The percentile value
     """
-    try:
-        from mlflow.openai.utils.chat_schema import set_span_chat_attributes
-        from mlflow.types.responses import ResponsesAgentResponse, ResponsesAgentStreamEvent
+    if not sorted_data:
+        return 0.0
 
-        if isinstance(outputs, ResponsesAgentResponse):
-            inputs = inputs["request"].model_dump_compat()
-            set_span_chat_attributes(span, inputs, outputs)
-        elif isinstance(outputs, list) and all(
-            isinstance(o, ResponsesAgentStreamEvent) for o in outputs
-        ):
-            inputs = inputs["request"].model_dump_compat()
-            output_items = []
-            custom_outputs = None
-            for o in outputs:
-                if o.type == "response.output_item.done":
-                    output_items.append(o.item)
-                if o.custom_outputs:
-                    custom_outputs = o.custom_outputs
-            output = ResponsesAgentResponse(
-                output=output_items,
-                custom_outputs=custom_outputs,
-            )
-            set_span_chat_attributes(span, inputs, output)
-    except Exception:
-        pass
+    n = len(sorted_data)
+    index = percentile * (n - 1)
+    lower = int(index)
+    upper = lower + 1
+
+    if upper >= n:
+        return sorted_data[-1]
+
+    # Linear interpolation between two nearest values
+    weight = index - lower
+    return sorted_data[lower] * (1 - weight) + sorted_data[upper] * weight
 
 
-def add_size_bytes_to_trace_metadata(trace: Trace):
+def add_size_stats_to_trace_metadata(trace: Trace):
     """
-    Calculate the size of the trace in bytes and add it as a tag to the trace.
+    Calculate the stats of trace and span sizes and add it as a metadata to the trace.
 
     This method modifies the trace object in place by adding a new tag.
 
     Note: For simplicity, we calculate the size without considering the size metadata itself.
     This provides a close approximation without requiring complex calculations.
+
+    This function must not throw an exception.
     """
-    trace_size_bytes = len(trace.to_json().encode("utf-8"))
-    trace.info.trace_metadata[TraceMetadataKey.SIZE_BYTES] = str(trace_size_bytes)
+    from mlflow.entities import Trace, TraceData
+
+    try:
+        span_sizes = []
+        for span in trace.data.spans:
+            span_json = json.dumps(span.to_dict(), cls=TraceJSONEncoder)
+            span_sizes.append(len(span_json.encode("utf-8")))
+
+        # NB: To compute the size of the total trace, we need to include the size of the
+        # the trace info and the parent dicts for the spans. To avoid serializing spans
+        # again (which can be expensive), we compute the size of the trace without spans
+        # and combine it with the total size of the spans.
+        empty_trace = Trace(info=trace.info, data=TraceData(spans=[]))
+        metadata_size = len((empty_trace.to_json()).encode("utf-8"))
+
+        # NB: the third term is the size of comma separators between spans (", ").
+        trace_size_bytes = sum(span_sizes) + metadata_size + (len(span_sizes) - 1) * 2
+
+        # Sort span sizes for percentile calculation
+        sorted_span_sizes = sorted(span_sizes)
+
+        size_stats = {
+            TraceSizeStatsKey.TOTAL_SIZE_BYTES: trace_size_bytes,
+            TraceSizeStatsKey.NUM_SPANS: len(span_sizes),
+            TraceSizeStatsKey.MAX_SPAN_SIZE_BYTES: max(span_sizes),
+            TraceSizeStatsKey.P25_SPAN_SIZE_BYTES: int(
+                _calculate_percentile(sorted_span_sizes, 0.25)
+            ),
+            TraceSizeStatsKey.P50_SPAN_SIZE_BYTES: int(
+                _calculate_percentile(sorted_span_sizes, 0.50)
+            ),
+            TraceSizeStatsKey.P75_SPAN_SIZE_BYTES: int(
+                _calculate_percentile(sorted_span_sizes, 0.75)
+            ),
+        }
+
+        trace.info.trace_metadata[TraceMetadataKey.SIZE_STATS] = json.dumps(size_stats)
+        # Keep the total size as a separate metadata for backward compatibility
+        trace.info.trace_metadata[TraceMetadataKey.SIZE_BYTES] = str(trace_size_bytes)
+    except Exception:
+        _logger.warning("Failed to add size stats to trace metadata.", exc_info=True)
 
 
 def update_trace_state_from_span_conditionally(trace, root_span):
@@ -542,4 +794,162 @@ def update_trace_state_from_span_conditionally(trace, root_span):
     # If the trace state is anything else, it means the user explicitly set it
     # and we should preserve it
     if trace.info.state == TraceState.IN_PROGRESS:
-        trace.info.state = TraceState.from_otel_status(root_span.status)
+        state = TraceState.from_otel_status(root_span.status)
+        # If the root span is created by the native OpenTelemetry SDK, the status code can be UNSET
+        # (default value when an otel span is ended). Override it to OK here to avoid backend error.
+        if state == TraceState.STATE_UNSPECIFIED:
+            state = TraceState.OK
+        trace.info.state = state
+
+
+def get_experiment_id_for_trace(span: OTelReadableSpan) -> str:
+    """
+    Determine the experiment ID to associate with the trace.
+
+    The experiment ID can be configured in multiple ways, in order of precedence:
+      1. An experiment ID specified via the span creation API i.e. MlflowClient().start_trace()
+      2. An experiment ID specified via `mlflow.tracing.set_destination`
+      3. An experiment ID of an active run.
+      4. The default experiment ID
+
+    Args:
+        span: The OpenTelemetry ReadableSpan to extract experiment ID from.
+
+    Returns:
+        The experiment ID string to use for the trace.
+    """
+    from mlflow.tracing.provider import _MLFLOW_TRACE_USER_DESTINATION
+    from mlflow.tracking.fluent import _get_experiment_id, _get_latest_active_run
+
+    if experiment_id := get_otel_attribute(span, SpanAttributeKey.EXPERIMENT_ID):
+        return experiment_id
+
+    if destination := _MLFLOW_TRACE_USER_DESTINATION.get():
+        if exp_id := getattr(destination, "experiment_id", None):
+            return exp_id
+
+    if run := _get_latest_active_run():
+        return run.info.experiment_id
+
+    return _get_experiment_id()
+
+
+def get_active_spans_table_name() -> str | None:
+    """
+    Get active Unity Catalog spans table name that's set by `mlflow.tracing.set_destination`.
+    """
+    from mlflow.entities.trace_location import UCSchemaLocation, UnityCatalog
+    from mlflow.tracing.provider import _MLFLOW_TRACE_USER_DESTINATION
+
+    if destination := _MLFLOW_TRACE_USER_DESTINATION.get():
+        if isinstance(destination, (UCSchemaLocation, UnityCatalog)):
+            return destination.full_otel_spans_table_name
+
+    return None
+
+
+def generate_assessment_id() -> str:
+    """
+    Generates an assessment ID of the form 'a-<uuid4>' in hex string format.
+
+    Returns:
+        A unique identifier for an assessment that will be logged to a trace tag.
+    """
+    id = uuid.uuid4().hex
+    return f"{ASSESSMENT_ID_PREFIX}{id}"
+
+
+@contextmanager
+def _bypass_attribute_guard(span: OTelSpan) -> Generator[None, None, None]:
+    """
+    OpenTelemetry does not allow setting attributes if the span has end time defined.
+    https://github.com/open-telemetry/opentelemetry-python/blob/d327927d0274a320466feec6fba6d6ddb287dc5a/opentelemetry-sdk/src/opentelemetry/sdk/trace/__init__.py#L849-L851
+
+    However, we need to set some attributes within `on_end` handler of the span processor,
+    where the span is already marked as ended. This context manager is a hacky workaround
+    to bypass the attribute guard.
+
+    Since opentelemetry-sdk 1.43.0, `Span.end()` additionally marks the span's
+    `BoundedAttributes` as immutable, which raises a `TypeError` on any write regardless of
+    the end time. We temporarily clear that flag as well and restore it afterwards.
+    """
+    original_end_time = span._end_time
+    span._end_time = None
+    attributes = span._attributes
+    original_immutable = getattr(attributes, "_immutable", None)
+    if original_immutable is not None:
+        attributes._immutable = False
+    try:
+        yield
+    finally:
+        span._end_time = original_end_time
+        if original_immutable is not None:
+            attributes._immutable = original_immutable
+
+
+def parse_trace_id_v4(trace_id: str | None) -> tuple[str | None, str | None]:
+    """
+    Parse the trace ID into location and trace ID components.
+    """
+    if trace_id is None:
+        return None, None
+    if trace_id.startswith(TRACE_ID_V4_PREFIX):
+        match trace_id.removeprefix(TRACE_ID_V4_PREFIX).split("/"):
+            case [location, tid] if location and tid:
+                return location, tid
+            case _:
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace ID format: {trace_id}. "
+                    f"Expected format: {TRACE_ID_V4_PREFIX}<location>/<trace_id>"
+                )
+    return None, trace_id
+
+
+def construct_trace_id_v4(location: str, trace_id: str) -> str:
+    """
+    Construct a trace ID for the given location and trace ID.
+    """
+    return f"{TRACE_ID_V4_PREFIX}{location}/{trace_id}"
+
+
+def set_span_model_attribute(span: LiveSpan, inputs: dict[str, Any]) -> None:
+    """
+    Set the model attribute on a span using parsed model information.
+
+    This utility function extracts the model name from inputs and
+    sets it as a span attribute. It's used by autologging implementations to
+    consistently set model information across different LLM providers.
+
+    Args:
+        span: The LiveSpan to set the model attribute on
+        inputs: The request inputs dictionary
+    """
+    try:
+        if (model := inputs.get("model")) and isinstance(model, str):
+            span.set_attribute(SpanAttributeKey.MODEL, model)
+    except Exception as e:
+        _logger.debug(f"Failed to set model for {span}. Error: {e}")
+
+
+def should_compute_cost_client_side() -> bool:
+    """Whether LLM cost should be computed on the client side.
+
+    Returns True only for Databricks backends where server-side
+    translate_span_when_storing() does not run. For non-Databricks backends,
+    cost is computed server-side in sqlalchemy_store.log_spans().
+    """
+    from mlflow.tracking._tracking_service.utils import get_tracking_uri
+    from mlflow.utils.uri import is_databricks_uri
+
+    return is_databricks_uri(get_tracking_uri())
+
+
+def set_span_cost_attribute(span: LiveSpan) -> None:
+    """
+    Set the cost attribute on a span using calculated cost information.
+    """
+    try:
+        if cost := calculate_span_cost(span):
+            span.set_attribute(SpanAttributeKey.LLM_COST, cost)
+    except Exception as e:
+        _logger.debug(f"Failed to set cost for {span}. Error: {e}")

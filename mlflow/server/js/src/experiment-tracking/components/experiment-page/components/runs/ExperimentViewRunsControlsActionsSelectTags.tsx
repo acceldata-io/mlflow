@@ -12,9 +12,10 @@ import {
 import { useState } from 'react';
 import { isUserFacingTag } from '@mlflow/mlflow/src/common/utils/TagUtils';
 import { setRunTagsBulkApi } from '@mlflow/mlflow/src/experiment-tracking/actions';
-import { KeyValueEntity, RunInfoEntity } from '@mlflow/mlflow/src/experiment-tracking/types';
+import type { RunInfoEntity } from '../../../../types';
+import type { KeyValueEntity } from '../../../../../common/types';
 import { useDispatch } from 'react-redux';
-import { ThunkDispatch } from '@mlflow/mlflow/src/redux-types';
+import type { ThunkDispatch } from '@mlflow/mlflow/src/redux-types';
 import { ExperimentViewRunsControlsActionsAddNewTagModal } from './ExperimentViewRunsControlsActionsAddNewTagModal';
 import { uniq } from 'lodash';
 import { FormattedMessage } from 'react-intl';
@@ -47,11 +48,14 @@ const getRunsTagsSelection = (
     return [];
   });
 
-  const allRunsTags: string[] = tagsList.flatMap((tags) => {
-    return Object.keys(tags)
-      .filter(isUserFacingTag)
-      .map((tagKey) => convertTagToString(tags[tagKey]));
-  });
+  // Deduplicate and sort alphabetically so tags always appear in a consistent order
+  const allRunsTags: string[] = uniq(
+    tagsList.flatMap((tags) => {
+      return Object.keys(tags)
+        .filter(isUserFacingTag)
+        .map((tagKey) => convertTagToString(tags[tagKey]));
+    }),
+  ).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }));
 
   const selectedRunsAllSelectedTags: string[] = allRunsTags.filter((tag) =>
     selectedRunsTagArray.every((selectedTags) => selectedTags.includes(tag)),
@@ -98,7 +102,7 @@ export const ExperimentViewRunsControlsActionsSelectTags = ({
 
   const openDropdown = (newTag?: KeyValueEntity) => {
     setSelectedTags(() => {
-      const selectedValues: Record<string, boolean | undefined> = { ...selectedTags };
+      const selectedValues = { ...selectedTags } satisfies Record<string, boolean | undefined>;
       allTags.forEach((tag) => {
         if (allSelectedTags.includes(tag)) {
           selectedValues[tag] = true;
@@ -188,18 +192,21 @@ export const ExperimentViewRunsControlsActionsSelectTags = ({
         />
         <DialogComboboxContent matchTriggerWidth>
           <DialogComboboxOptionList>
-            {Object.keys(selectedTags).map((tagString) => {
-              const isIndeterminate = selectedTags[tagString] === undefined;
-              return (
-                <DialogComboboxOptionListCheckboxItem
-                  key={tagString}
-                  value={tagString}
-                  onChange={handleChange}
-                  checked={selectedTags[tagString]}
-                  indeterminate={isIndeterminate}
-                />
-              );
-            })}
+            {/* Sort keys alphabetically so the dropdown list is always ordered consistently */}
+            {Object.keys(selectedTags)
+              .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true }))
+              .map((tagString) => {
+                const isIndeterminate = selectedTags[tagString] === undefined;
+                return (
+                  <DialogComboboxOptionListCheckboxItem
+                    key={tagString}
+                    value={tagString}
+                    onChange={handleChange}
+                    checked={selectedTags[tagString]}
+                    indeterminate={isIndeterminate}
+                  />
+                );
+              })}
           </DialogComboboxOptionList>
           <DialogComboboxFooter>
             <div css={{ display: 'flex', justifyContent: 'flex-end', gap: theme.spacing.sm }}>

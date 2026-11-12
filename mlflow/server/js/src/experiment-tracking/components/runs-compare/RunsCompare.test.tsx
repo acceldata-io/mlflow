@@ -1,3 +1,4 @@
+import { jest, expect, describe, beforeEach, test } from '@jest/globals';
 import { MockedReduxStoreProvider } from '../../../common/utils/TestUtils';
 import {
   renderWithIntl,
@@ -8,30 +9,29 @@ import {
   waitFor,
   cleanup,
 } from '@mlflow/mlflow/src/common/utils/TestUtils.react18';
-import { ImageEntity, MetricEntitiesByName } from '../../types';
+import type { ImageEntity, MetricEntitiesByName } from '../../types';
 import { ExperimentPageUIStateContextProvider } from '../experiment-page/contexts/ExperimentPageUIStateContext';
-import {
-  createExperimentPageUIState,
+import type {
   ExperimentPageUIState,
   ExperimentRunsChartsUIConfiguration,
 } from '../experiment-page/models/ExperimentPageUIState';
-import { RunRowType } from '../experiment-page/utils/experimentPage.row-types';
-import {
-  RunsChartType,
+import { createExperimentPageUIState } from '../experiment-page/models/ExperimentPageUIState';
+import type { RunRowType } from '../experiment-page/utils/experimentPage.row-types';
+import type {
   RunsChartsBarCardConfig,
   RunsChartsLineCardConfig,
   RunsChartsParallelCardConfig,
   RunsChartsDifferenceCardConfig,
-  DifferenceCardConfigCompareGroup,
 } from '../runs-charts/runs-charts.types';
+import { RunsChartType, DifferenceCardConfigCompareGroup } from '../runs-charts/runs-charts.types';
 import { RunsCompare } from './RunsCompare';
 import { useSampledMetricHistory } from '../runs-charts/hooks/useSampledMetricHistory';
 import userEvent from '@testing-library/user-event';
 import { RunsChartsLineChartXAxisType } from '../runs-charts/components/RunsCharts.common';
-import { shouldEnableDifferenceViewCharts } from '../../../common/utils/FeatureUtils';
 import { useState } from 'react';
 import { DesignSystemProvider } from '@databricks/design-system';
 
+// eslint-disable-next-line no-restricted-syntax -- TODO(FEINF-4392)
 jest.setTimeout(30000); // Larger timeout for integration testing
 
 // Mock the chart component to save time on rendering
@@ -51,7 +51,6 @@ jest.mock('../../../common/utils/FeatureUtils', () => ({
   ...jest.requireActual<typeof import('../../../common/utils/FeatureUtils')>('../../../common/utils/FeatureUtils'),
   shouldEnableHidingChartsWithNoData: jest.fn(() => false),
   shouldEnableImageGridCharts: jest.fn(() => true),
-  shouldEnableDifferenceViewCharts: jest.fn(() => false),
 }));
 
 // Mock useIsInViewport hook to simulate that the chart element is in the viewport
@@ -59,10 +58,11 @@ jest.mock('../runs-charts/hooks/useIsInViewport', () => ({
   useIsInViewport: () => ({ isInViewport: true, setElementRef: jest.fn() }),
 }));
 
+// eslint-disable-next-line no-restricted-syntax -- TODO(FEINF-4392)
 jest.setTimeout(30000); // Larger timeout for integration testing
 
 // Helper function to assert order of HTMLElements
-function assertElementsInOrder(elements: HTMLElement[]) {
+function expectElementsInOrder(elements: HTMLElement[]) {
   for (let i = 0; i < elements.length - 1; i++) {
     const current = elements[i];
     const next = elements[i + 1];
@@ -227,6 +227,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
             hideEmptyCharts={uiState.hideEmptyCharts}
             chartsSearchFilter={uiState.chartsSearchFilter}
             storageKey="some-experiment-id"
+            minWidth={800}
           />
         </ExperimentPageUIStateContextProvider>
       );
@@ -251,8 +252,13 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
   };
 
   const getChartArea = (chartTitle: string) => {
-    const firstMetricHeading = screen.getByRole('heading', { name: chartTitle });
-    return firstMetricHeading.closest('[data-testid="experiment-view-compare-runs-card"]') as HTMLElement;
+    const displayTitle = chartTitle.split('/').pop() ?? chartTitle;
+    const chartPlot =
+      screen.queryByText(`[bar plot for ${chartTitle}]`) ??
+      screen.queryByText(`[line plot for ${chartTitle}]`) ??
+      screen.queryByRole('heading', { name: chartTitle }) ??
+      screen.getByRole('heading', { name: displayTitle });
+    return chartPlot.closest('[data-testid="experiment-view-compare-runs-card"]') as HTMLElement;
   };
 
   const getSectionArea = (sectionName: string) => {
@@ -316,10 +322,29 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('[bar plot for metric-static]'),
         screen.getByText('[line plot for metric-with-history]'),
       ]);
+    });
+  });
+
+  test('uses full metric paths to disambiguate duplicate leaf names', async () => {
+    currentUIState.compareRunCharts = undefined;
+
+    createComponentMock({
+      comparedRuns: [{ runUuid: 'run_latest', runName: 'Last run', runInfo: {} }] as any,
+      latestMetricsByRunUuid: {
+        run_latest: {
+          'groupA/duplicate_leaf': { key: 'groupA/duplicate_leaf', value: 1, step: 0 },
+          'groupB/duplicate_leaf': { key: 'groupB/duplicate_leaf', value: 2, step: 0 },
+        },
+      } as any,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'groupA/duplicate_leaf' })).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'groupB/duplicate_leaf' })).toBeInTheDocument();
     });
   });
 
@@ -344,7 +369,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('tmp'),
         screen.getByText('Model metrics'),
         screen.getByText('System metrics'),
@@ -380,7 +405,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(async () => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('Model metrics'),
         screen.getByText('System metrics'),
         screen.getByText('tmp'),
@@ -400,7 +425,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(async () => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('System metrics'),
         screen.getByText('Model metrics'),
         screen.getByText('tmp'),
@@ -433,7 +458,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
 
     await waitFor(() => {
       expect(screen.queryByText('tmp1')).not.toBeInTheDocument();
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('tmp'),
         screen.getByText('tmp2'),
         screen.getByText('Model metrics'),
@@ -471,7 +496,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('tmp'),
         screen.getByText('tmp1'),
         screen.getByText('tmp2'),
@@ -505,7 +530,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('tmp'),
         screen.getByText('tmp2'),
         screen.getByText('Model metrics'),
@@ -554,7 +579,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('tmp2'),
         screen.getByText('tmp'),
         screen.getByText('Model metrics'),
@@ -628,7 +653,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('[bar plot for section1/metric3]'),
         screen.getByText('[bar plot for section1/metric5]'),
         screen.getByText('[bar plot for section1/metric6]'),
@@ -661,7 +686,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('[bar plot for section1/metric3]'),
         screen.getByText('[bar plot for section1/metric4]'),
         screen.getByText('[bar plot for section1/metric5]'),
@@ -693,7 +718,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('[bar plot for section1/metric5]'),
         screen.getByText('[bar plot for section2/metric6]'),
       ]);
@@ -741,7 +766,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('[bar plot for section1/metric3]'),
         screen.getByText('[bar plot for section1/metric7]'),
         screen.getByText('[bar plot for section1/metric4]'),
@@ -773,7 +798,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('[bar plot for section1/metric5]'),
         screen.getByText('[bar plot for section2/metric6]'),
       ]);
@@ -821,7 +846,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('[bar plot for section2/metric6]'),
         screen.getByText('[bar plot for section1/metric3]'),
         screen.getByText('[bar plot for section1/metric5]'),
@@ -859,7 +884,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('tmp'),
         screen.getByText('tmp2'),
         screen.getByText('Model metrics'),
@@ -904,7 +929,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('tmp'),
         screen.getByText('tmp1'),
         screen.getByText('tmp2'),
@@ -985,7 +1010,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     });
 
     await waitFor(() => {
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('tmp/image'),
         screen.getByText('tmp1/image3'),
         screen.getByText('tmp2/image1'),
@@ -1100,10 +1125,11 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
     currentUIState.compareRunCharts = undefined;
     currentUIState.compareRunSections = undefined;
 
-    // Render a component with a group and a run:
+    // Render a component with a group, a remaining runs group header, and its member run:
     // - a group contains aggregated "metric_1" data indicating history
     // - a group contains aggregated "metric_2" data not indicating any history
-    // - a run contains "metric_3" data indicating history
+    // - a remaining runs group header contains aggregated "metric_3" data indicating history
+    // - an ungrouped run (put into the remaining group) contains "metric_3" data indicating history
     createComponentMock({
       groupBy: 'metric_1',
       comparedRuns: [
@@ -1127,6 +1153,23 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
           },
         },
         {
+          runUuid: '',
+          rowUuid: 'remaining_group',
+          groupParentInfo: {
+            groupId: 'remaining_group',
+            groupingValues: [],
+            isRemainingRunsGroup: true,
+            runUuids: ['run_1'],
+            aggregatedMetricData: {
+              metric_3: {
+                key: 'metric_3',
+                value: 1,
+                maxStep: 3,
+              },
+            },
+          },
+        },
+        {
           runUuid: 'run_1',
           runName: 'First run',
           runInfo: { runUuid: 'run_1' },
@@ -1142,7 +1185,7 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
 
     await waitFor(() => {
       // Assert correct chart types for metrics
-      assertElementsInOrder([
+      expectElementsInOrder([
         screen.getByText('[line plot for metric_1]'),
         screen.getByText('[bar plot for metric_2]'),
         screen.getByText('[line plot for metric_3]'),
@@ -1153,8 +1196,6 @@ describe.each(testCases)('RunsCompare $description', ({ setup: testCaseSetup }) 
   describe('hiding charts with no data', () => {
     // Set up charts
     beforeEach(() => {
-      jest.mocked(shouldEnableDifferenceViewCharts).mockImplementation(() => true);
-
       currentUIState.compareRunCharts = [
         {
           type: RunsChartType.BAR,

@@ -2,12 +2,13 @@ import { isEqual } from 'lodash';
 import React, { createContext, useCallback, useMemo, useState } from 'react';
 import { mapErrorWrapperToPredefinedError } from '../../../../common/utils/ErrorUtils';
 import { shouldUsePredefinedErrorsInExperimentTracking } from '../../../../common/utils/FeatureUtils';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ErrorWrapper } from '../../../../common/utils/ErrorWrapper';
 import RequestStateWrapper from '../../../../common/components/RequestStateWrapper';
 import Utils from '../../../../common/utils/Utils';
 import type { getExperimentApi, setCompareExperiments, setExperimentTagApi } from '../../../actions';
 import { useDispatch } from 'react-redux';
-import { ThunkDispatch } from '../../../../redux-types';
+import type { ThunkDispatch } from '../../../../redux-types';
 
 export interface GetExperimentsContextActions {
   setExperimentTagApi: typeof setExperimentTagApi;
@@ -122,8 +123,8 @@ export const GetExperimentsContextProvider = ({
   return (
     <GetExperimentsContext.Provider value={contextValue}>
       <RequestStateWrapper
+        // prettier-ignore
         shouldOptimisticallyRender
-        // eslint-disable-next-line no-trailing-spaces
         requestIds={fetchExperimentsRequestIds}
       >
         {renderFn}

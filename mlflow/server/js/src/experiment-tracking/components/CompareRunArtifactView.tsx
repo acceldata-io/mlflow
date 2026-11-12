@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import ShowArtifactPage from './artifact-view-components/ShowArtifactPage';
-import { RunInfoEntity } from '../types';
+import type { RunInfoEntity } from '../types';
 import { useRunsArtifacts } from './experiment-page/hooks/useRunsArtifacts';
 import { getCommonArtifacts } from './experiment-page/utils/getCommonArtifacts';
 import { useDesignSystemTheme } from '@databricks/design-system';
@@ -69,16 +69,16 @@ export const CompareRunArtifactView = ({
           overflow: 'hidden',
         }}
       >
-        <div css={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap' }}>
+        <div css={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap', width: '100%' }}>
           {runUuids.map((runUuid, index) => (
             <div
               key={runUuid}
               style={{
-                width: `${colWidth}px`,
+                flex: `1 1 ${colWidth}px`,
+                minWidth: `${colWidth}px`,
                 borderBottom: `1px solid ${theme.colors.grey300}`,
                 padding: !artifactPath ? theme.spacing.md : 0,
                 overflow: 'auto',
-                whiteSpace: 'nowrap',
               }}
             >
               <ShowArtifactPage

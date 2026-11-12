@@ -1,27 +1,10 @@
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, Optional, Union
+import warnings
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel as _BaseModel
-from pydantic import Field
-
-from mlflow.utils import IS_PYDANTIC_V2_OR_NEWER
-
-
-class BaseModel(_BaseModel):
-    @classmethod
-    def validate_compat(cls, obj: Any):
-        if IS_PYDANTIC_V2_OR_NEWER:
-            return cls.model_validate(obj)
-        else:
-            return cls.parse_obj(obj)
-
-    def model_dump_compat(self, **kwargs):
-        if IS_PYDANTIC_V2_OR_NEWER:
-            return self.model_dump(**kwargs)
-        else:
-            return self.dict(**kwargs)
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 
 class TextContentPart(BaseModel):
@@ -44,7 +27,7 @@ class ImageUrl(BaseModel):
     """
 
     url: str
-    detail: Optional[Literal["auto", "low", "high"]] = None
+    detail: Literal["auto", "low", "high"] | None = None
 
 
 class ImageContentPart(BaseModel):
@@ -62,19 +45,44 @@ class AudioContentPart(BaseModel):
     input_audio: InputAudio
 
 
+class ReasoningSummaryPart(BaseModel):
+    type: Literal["summary_text"]
+    text: str
+
+
+class ReasoningContentPart(BaseModel):
+    """
+    A reasoning (a.k.a. "thinking") content part that some models emit alongside their
+    text response, e.g. GPT-OSS / Harmony-format models surface their analysis channel as:
+
+    .. code-block:: json
+
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "..."}]}
+
+    Providers may attach additional metadata (e.g. ``id``, ``encrypted_content``, ``status``),
+    so extra fields are allowed to keep validation forward-compatible.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["reasoning"]
+    summary: list[ReasoningSummaryPart] = Field(default_factory=list)
+
+
 ContentPartsList = list[
     Annotated[
-        Union[TextContentPart, ImageContentPart, AudioContentPart], Field(discriminator="type")
+        TextContentPart | ImageContentPart | AudioContentPart | ReasoningContentPart,
+        Field(discriminator="type"),
     ]
 ]
 
 
-ContentType = Annotated[Union[str, ContentPartsList], Field(union_mode="left_to_right")]
+ContentType = Annotated[str | ContentPartsList, Field(union_mode="left_to_right")]
 
 
 class Function(BaseModel):
-    name: str
-    arguments: str
+    name: str | None = None
+    arguments: str | None = None
 
     def to_tool_call(self, id=None) -> ToolCall:
         if id is None:
@@ -86,6 +94,17 @@ class ToolCall(BaseModel):
     id: str
     type: str = Field(default="function")
     function: Function
+    # Gemini thinking-mode models return a thought_signature with each
+    # function call that must be echoed back in subsequent turns.
+    # https://ai.google.dev/gemini-api/docs/thought-signatures
+    thought_signature: str | None = Field(default=None)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if data.get("thought_signature") is None:
+            data.pop("thought_signature", None)
+        return data
 
 
 class ChatMessage(BaseModel):
@@ -97,10 +116,11 @@ class ChatMessage(BaseModel):
     - :py:class:`TextContentPart <mlflow.types.chat.TextContentPart>`
     - :py:class:`ImageContentPart <mlflow.types.chat.ImageContentPart>`
     - :py:class:`AudioContentPart <mlflow.types.chat.AudioContentPart>`
+    - :py:class:`ReasoningContentPart <mlflow.types.chat.ReasoningContentPart>`
     """
 
     role: str
-    content: Optional[ContentType] = None
+    content: ContentType | None = None
     # NB: In the actual OpenAI chat completion API spec, these fields only
     #   present in either the request or response message (tool_call_id is only in
     #   the request, while the other two are only in the response).
@@ -112,35 +132,49 @@ class ChatMessage(BaseModel):
     # TODO: Define a sub classes for different type of messages (request/response, and
     #   system/user/assistant/tool, etc), and create a factory function to allow users
     #   to create them without worrying about the details.
-    tool_calls: Optional[list[ToolCall]] = None
-    refusal: Optional[str] = None
-    tool_call_id: Optional[str] = None
+    tool_calls: list[ToolCall] | None = None
+    refusal: str | None = None
+    tool_call_id: str | None = None
+
+
+AllowedType = Literal["string", "number", "integer", "object", "array", "boolean", "null"]
 
 
 class ParamType(BaseModel):
-    type: Optional[Literal["string", "number", "integer", "object", "array", "boolean", "null"]] = (
-        None
-    )
+    type: AllowedType | list[AllowedType] | None = None
 
 
 class ParamProperty(ParamType):
-    description: Optional[str] = None
-    enum: Optional[list[str]] = None
-    items: Optional[ParamType] = None
+    """
+    OpenAI uses JSON Schema (https://json-schema.org/) for function parameters.
+    See OpenAI function calling reference:
+    https://platform.openai.com/docs/guides/function-calling?&api-mode=responses#defining-functions
+
+    JSON Schema enum supports any JSON type (str, int, float, bool, null, arrays, objects),
+    but we restrict to basic scalar types for practical use cases and API safety.
+    """
+
+    description: str | None = None
+    enum: list[str | int | float | bool] | None = None
+    # Recursive type so nested arrays (e.g. list[list[str]]) preserve their inner
+    # `items` schema through Pydantic round-trips. If this were `ParamType`, the
+    # inner `items` field would be silently stripped and downstream providers
+    # would reject the schema with "array schema missing items".
+    items: ParamProperty | None = None
 
 
 class FunctionParams(BaseModel):
     properties: dict[str, ParamProperty]
     type: Literal["object"] = "object"
-    required: Optional[list[str]] = None
-    additionalProperties: Optional[bool] = None
+    required: list[str] | None = None
+    additionalProperties: bool | None = None
 
 
 class FunctionToolDefinition(BaseModel):
     name: str
-    description: Optional[str] = None
-    parameters: Optional[FunctionParams] = None
-    strict: Optional[bool] = None
+    description: str | None = None
+    parameters: FunctionParams | None = None
+    strict: bool | None = None
 
 
 class ChatTool(BaseModel):
@@ -151,21 +185,82 @@ class ChatTool(BaseModel):
     """
 
     type: Literal["function"]
-    function: Optional[FunctionToolDefinition] = None
+    function: FunctionToolDefinition | None = None
+
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message='Field name "schema" in "JsonSchemaSpec" shadows an attribute in parent '
+        '"BaseModel"',
+        category=UserWarning,
+    )
+
+    class JsonSchemaSpec(BaseModel):
+        """
+        OpenAI-compatible JSON Schema envelope for structured outputs.
+
+        Attributes:
+            name: The schema name.
+            schema: A JSON Schema definition.
+            strict: Whether model output should strictly follow the schema.
+        """
+
+        model_config = ConfigDict(extra="allow")
+
+        name: str
+        schema: dict[str, Any] = Field(...)
+        strict: bool = True
+
+
+class ResponseFormat(BaseModel):
+    """
+    Response format configuration for structured outputs. Compatible with
+    OpenAI's Chat Completion API.
+
+    Supported formats:
+      - {"type": "text"}
+      - {"type": "json_object"}
+      - {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}, "strict": true}}
+    """
+
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: JsonSchemaSpec | None = None
+
+
+class ToolChoiceFunction(BaseModel):
+    """Specifies a tool the model should use."""
+
+    name: str
+
+
+class ToolChoice(BaseModel):
+    """
+    Specifies a particular tool to use.
+
+    OpenAI format: {"type": "function", "function": {"name": "my_function"}}
+    """
+
+    type: Literal["function"]
+    function: ToolChoiceFunction
 
 
 class BaseRequestPayload(BaseModel):
     """Common parameters used for chat completions and completion endpoints."""
 
-    temperature: float = Field(0.0, ge=0, le=2)
     n: int = Field(1, ge=1)
-    stop: Optional[list[str]] = (
-        Field(None, min_length=1) if IS_PYDANTIC_V2_OR_NEWER else Field(None, min_items=1)
-    )
-    max_tokens: Optional[int] = Field(None, ge=1)
-    stream: Optional[bool] = None
-    stream_options: Optional[dict[str, Any]] = None
-    model: Optional[str] = None
+    stop: list[str] | None = Field(None, min_length=1)
+    max_tokens: int | None = Field(None, ge=1)
+    max_completion_tokens: int | None = Field(None, ge=1)
+    stream: bool | None = None
+    stream_options: dict[str, Any] | None = None
+    model: str | None = None
+    response_format: ResponseFormat | None = None
+    temperature: float | None = Field(None, ge=0, le=2)
+    top_p: float | None = Field(None, ge=0, le=1)
+    presence_penalty: float | None = Field(None, ge=-2, le=2)
+    frequency_penalty: float | None = Field(None, ge=-2, le=2)
+    top_k: int | None = Field(None, ge=1)
 
 
 # NB: For interface constructs that rely on other BaseModel implementations, in
@@ -178,34 +273,70 @@ class BaseRequestPayload(BaseModel):
 class ChatChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
+
+
+class PromptTokensDetails(BaseModel):
+    model_config = {"extra": "allow"}
+
+    cached_tokens: int | None = None
 
 
 class ChatUsage(BaseModel):
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
+    model_config = {"extra": "allow"}
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    prompt_tokens_details: PromptTokensDetails | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if data.get("prompt_tokens_details") is None:
+            data.pop("prompt_tokens_details", None)
+        return data
+
+
+class ToolCallDelta(BaseModel):
+    index: int
+    id: str | None = None
+    type: str | None = None
+    function: Function
+    # Gemini thinking-mode models return a thought_signature with each
+    # function call that must be echoed back in subsequent turns.
+    # https://ai.google.dev/gemini-api/docs/thought-signatures
+    thought_signature: str | None = Field(default=None)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if data.get("thought_signature") is None:
+            data.pop("thought_signature", None)
+        return data
 
 
 class ChatChoiceDelta(BaseModel):
-    role: Optional[str] = None
-    content: Optional[str] = None
+    role: str | None = None
+    content: str | None = None
+    tool_calls: list[ToolCallDelta] | None = None
 
 
 class ChatChunkChoice(BaseModel):
     index: int
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
     delta: ChatChoiceDelta
 
 
 class ChatCompletionChunk(BaseModel):
     """A chunk of a chat completion stream response."""
 
-    id: Optional[str] = None
+    id: str | None = None
     object: str = "chat.completion.chunk"
     created: int
     model: str
     choices: list[ChatChunkChoice]
+    usage: ChatUsage | None = None
 
 
 class ChatCompletionRequest(BaseRequestPayload):
@@ -216,12 +347,9 @@ class ChatCompletionRequest(BaseRequestPayload):
     https://platform.openai.com/docs/api-reference/chat
     """
 
-    messages: list[ChatMessage] = (
-        Field(..., min_length=1) if IS_PYDANTIC_V2_OR_NEWER else Field(..., min_items=1)
-    )
-    tools: Optional[list[ChatTool]] = (
-        Field(None, min_length=1) if IS_PYDANTIC_V2_OR_NEWER else Field(None, min_items=1)
-    )
+    messages: list[ChatMessage] = Field(..., min_length=1)
+    tools: list[ChatTool] | None = Field(None, min_length=1)
+    tool_choice: Literal["none", "auto", "required"] | ToolChoice | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -232,7 +360,7 @@ class ChatCompletionResponse(BaseModel):
     https://platform.openai.com/docs/api-reference/chat
     """
 
-    id: Optional[str] = None
+    id: str | None = None
     object: str = "chat.completion"
     created: int
     model: str

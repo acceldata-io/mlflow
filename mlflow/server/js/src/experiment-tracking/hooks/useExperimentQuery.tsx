@@ -1,6 +1,7 @@
-import { gql, QueryHookOptions } from '@mlflow/mlflow/src/common/utils/graphQLHooks';
+import type { QueryHookOptions } from '@mlflow/mlflow/src/common/utils/graphQLHooks';
+import { gql } from '@mlflow/mlflow/src/common/utils/graphQLHooks';
 import { useQuery } from '@mlflow/mlflow/src/common/utils/graphQLHooks';
-import { MlflowGetExperimentQuery, MlflowGetExperimentQueryVariables } from '../../graphql/__generated__/graphql';
+import type { MlflowGetExperimentQuery, MlflowGetExperimentQueryVariables } from '../../graphql/__generated__/graphql';
 import { isArray } from 'lodash';
 import { NotFoundError } from '@databricks/web-shared/errors';
 
@@ -14,6 +15,7 @@ const GET_EXPERIMENT_QUERY = gql`
       experiment {
         artifactLocation
         creationTime
+        effectiveTraceArchivalRetention
         experimentId
         lastUpdateTime
         lifecycleStage

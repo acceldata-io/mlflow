@@ -1,20 +1,23 @@
-import json
-from typing import Optional
+import logging
 
-from opentelemetry.context import Context
 from opentelemetry.sdk.trace import ReadableSpan as OTelReadableSpan
-from opentelemetry.sdk.trace import Span as OTelSpan
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 
-from mlflow.entities.trace_info import TraceInfo
-from mlflow.entities.trace_location import TraceLocation
-from mlflow.entities.trace_state import TraceState
+from mlflow.entities.span import create_mlflow_span
+from mlflow.entities.trace_info import TraceInfo, TraceLocation, TraceState
+from mlflow.environment_variables import (
+    MLFLOW_ENABLE_OTEL_GENAI_SEMCONV,
+    MLFLOW_TRACE_ENABLE_OTLP_DUAL_EXPORT,
+)
 from mlflow.tracing.constant import TRACE_SCHEMA_VERSION, TRACE_SCHEMA_VERSION_KEY, SpanAttributeKey
+from mlflow.tracing.processor.otel_metrics_mixin import OtelMetricsMixin
 from mlflow.tracing.trace_manager import InMemoryTraceManager
 from mlflow.tracing.utils import generate_trace_id_v3
 
+_logger = logging.getLogger(__name__)
 
-class OtelSpanProcessor(BatchSpanProcessor):
+
+class OtelSpanProcessor(OtelMetricsMixin, BatchSpanProcessor):
     """
     SpanProcessor implementation to export MLflow traces to a OpenTelemetry collector.
 
@@ -22,8 +25,9 @@ class OtelSpanProcessor(BatchSpanProcessor):
     is started or ended (before exporting).
     """
 
-    def __init__(self, span_exporter: SpanExporter):
+    def __init__(self, span_exporter: SpanExporter, export_metrics: bool) -> None:
         super().__init__(span_exporter)
+        self._export_metrics = export_metrics
         # In opentelemetry-sdk 1.34.0, the `span_exporter` field was removed from the
         # `BatchSpanProcessor` class.
         # https://github.com/open-telemetry/opentelemetry-python/issues/4616
@@ -36,22 +40,62 @@ class OtelSpanProcessor(BatchSpanProcessor):
             self.span_exporter = span_exporter
         except AttributeError:
             pass
-        self._trace_manager = InMemoryTraceManager.get_instance()
 
-    def on_start(self, span: OTelSpan, parent_context: Optional[Context] = None):
-        """
-        Handle the start of a span. This method is called when an OpenTelemetry span is started.
+        # Only register traces with trace manager when NOT in dual export mode
+        # In dual export mode, MLflow span processors handle trace registration
+        self._should_register_traces = not MLFLOW_TRACE_ENABLE_OTLP_DUAL_EXPORT.get()
+        if self._should_register_traces:
+            self._trace_manager = InMemoryTraceManager.get_instance()
 
-        Args:
-            span: An OpenTelemetry Span object that is started.
-            parent_context: The context of the span. Note that this is only passed when the context
-                object is explicitly specified to OpenTelemetry start_span call. If the parent
-                span is obtained from the global context, it won't be passed here so we should not
-                rely on it.
-        """
-        trace_id = generate_trace_id_v3(span)
-        trace_info = TraceInfo(
-            trace_id=trace_id,
+    def on_start(self, span: OTelReadableSpan, parent_context=None):
+        if self._should_register_traces:
+            if not span.parent:
+                trace_info = self._create_trace_info(span)
+                trace_id = trace_info.trace_id
+                self._trace_manager.register_trace(span.context.trace_id, trace_info)
+            else:
+                trace_id = self._trace_manager.get_mlflow_trace_id_from_otel_id(
+                    span.context.trace_id
+                )
+            self._trace_manager.register_span(create_mlflow_span(span, trace_id))
+
+        super().on_start(span, parent_context)
+
+    def on_end(self, span: OTelReadableSpan):
+        if self._export_metrics:
+            self.record_metrics_for_span(span)
+
+        if self._should_register_traces and not span.parent:
+            manager_trace = self._trace_manager.pop_trace(span.context.trace_id)
+            # Emit user-defined tags as individual span attributes so they survive OTLP export
+            # and can be restored to trace tag rows on the server side.
+            if (
+                manager_trace is not None
+                and manager_trace.trace.info.tags
+                and span._attributes is not None
+            ):
+                for key, value in manager_trace.trace.info.tags.items():
+                    if not key.startswith("mlflow."):
+                        span._attributes[SpanAttributeKey.TRACE_TAG_PREFIX + key] = value
+
+        if MLFLOW_ENABLE_OTEL_GENAI_SEMCONV.get():
+            span = self._translate_span(span)
+
+        super().on_end(span)
+
+    def _translate_span(self, span: OTelReadableSpan) -> OTelReadableSpan:
+        try:
+            from mlflow.tracing.export.genai_semconv.translator import translate_span_to_genai
+
+            return translate_span_to_genai(span)
+        except Exception:
+            _logger.debug("Failed to translate span to GenAI semconv", exc_info=True)
+            return span
+
+    def _create_trace_info(self, span: OTelReadableSpan) -> TraceInfo:
+        """Create a TraceInfo object from an OpenTelemetry span."""
+        return TraceInfo(
+            trace_id=generate_trace_id_v3(span),
             trace_location=TraceLocation.from_experiment_id(None),
             request_time=span.start_time // 1_000_000,  # nanosecond to millisecond
             execution_duration=None,
@@ -59,15 +103,3 @@ class OtelSpanProcessor(BatchSpanProcessor):
             trace_metadata={TRACE_SCHEMA_VERSION_KEY: str(TRACE_SCHEMA_VERSION)},
             tags={},
         )
-        span.set_attribute(SpanAttributeKey.REQUEST_ID, json.dumps(trace_id))
-
-        self._trace_manager.register_trace(span.context.trace_id, trace_info)
-
-        super().on_start(span, parent_context)
-
-    def on_end(self, span: OTelReadableSpan):
-        # Pops the trace entry from the in-memory trace manager to avoid memory leak
-        if span._parent is None:
-            self._trace_manager.pop_trace(span.context.trace_id)
-
-        super().on_end(span)

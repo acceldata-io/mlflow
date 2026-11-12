@@ -1,5 +1,6 @@
 import os
 import posixpath
+import shutil
 import urllib.parse
 from contextlib import contextmanager
 
@@ -14,7 +15,7 @@ from mlflow.environment_variables import (
     MLFLOW_KERBEROS_USER,
     MLFLOW_PYARROW_EXTRA_CONF,
 )
-from mlflow.store.artifact.artifact_repo import ArtifactRepository
+from mlflow.store.artifact.artifact_repo import ARTIFACT_STREAM_CHUNK_SIZE, ArtifactRepository
 from mlflow.utils.file_utils import relative_path_to_artifact_path
 
 
@@ -26,9 +27,11 @@ class HdfsArtifactRepository(ArtifactRepository):
     together with the RestStore.
     """
 
-    def __init__(self, artifact_uri):
+    def __init__(
+        self, artifact_uri: str, tracking_uri: str | None = None, registry_uri: str | None = None
+    ) -> None:
+        super().__init__(artifact_uri, tracking_uri, registry_uri)
         self.scheme, self.host, self.port, self.path = _resolve_connection_params(artifact_uri)
-        super().__init__(artifact_uri)
 
     def log_artifact(self, local_file, artifact_path=None):
         """
@@ -45,7 +48,7 @@ class HdfsArtifactRepository(ArtifactRepository):
             destination_path = posixpath.join(hdfs_base_path, file_name)
             with open(local_file, "rb") as source:
                 with hdfs.open_output_stream(destination_path) as destination:
-                    destination.write(source.read())
+                    shutil.copyfileobj(source, destination, length=ARTIFACT_STREAM_CHUNK_SIZE)
 
     def log_artifacts(self, local_dir, artifact_path=None):
         """
@@ -79,7 +82,9 @@ class HdfsArtifactRepository(ArtifactRepository):
                     destination_path = posixpath.join(hdfs_subdir_path, each_file)
                     with open(source_path, "rb") as source:
                         with hdfs.open_output_stream(destination_path) as destination:
-                            destination.write(source.read())
+                            shutil.copyfileobj(
+                                source, destination, length=ARTIFACT_STREAM_CHUNK_SIZE
+                            )
 
     def list_artifacts(self, path=None):
         """
@@ -130,7 +135,7 @@ class HdfsArtifactRepository(ArtifactRepository):
         with hdfs_system(scheme=self.scheme, host=self.host, port=self.port) as hdfs:
             with hdfs.open_input_stream(hdfs_base_path) as source:
                 with open(local_path, "wb") as destination:
-                    destination.write(source.read())
+                    shutil.copyfileobj(source, destination, length=ARTIFACT_STREAM_CHUNK_SIZE)
 
     def delete_artifacts(self, artifact_path=None):
         path = posixpath.join(self.path, artifact_path) if artifact_path else self.path
@@ -200,7 +205,7 @@ def _parse_extra_conf(extra_conf):
     if extra_conf:
 
         def as_pair(config):
-            key, val = config.split("=")
+            key, val = config.split("=", 1)
             return key, val
 
         list_of_key_val = [as_pair(conf) for conf in extra_conf.split(",")]

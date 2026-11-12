@@ -3,10 +3,10 @@ import logging
 import os
 import shutil
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Callable, Literal, NamedTuple, Optional, Union
+from typing import Any, Callable, Literal, NamedTuple
 from urllib.parse import urlparse
 
 import yaml
@@ -15,6 +15,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 import mlflow
 from mlflow.entities import LoggedModel, LoggedModelOutput, Metric
 from mlflow.entities.model_registry.prompt_version import PromptVersion
+from mlflow.entities.run_outputs import RunOutputs
 from mlflow.environment_variables import (
     MLFLOW_PRINT_MODEL_URLS_ON_CREATION,
     MLFLOW_RECORD_ENV_VARS_IN_MODEL_LOGGING,
@@ -32,11 +33,12 @@ from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking._tracking_service.utils import _resolve_tracking_uri
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri, _upload_artifact_to_uri
 from mlflow.tracking.fluent import (
+    _create_logged_model,
     _get_active_model_context,
+    _last_logged_model_id,
     _set_active_model_id,
     _use_logged_model,
 )
-from mlflow.utils.annotations import experimental
 from mlflow.utils.databricks_utils import (
     _construct_databricks_logged_model_url,
     get_databricks_runtime_version,
@@ -59,11 +61,18 @@ from mlflow.utils.logging_utils import eprint
 from mlflow.utils.mlflow_tags import MLFLOW_MODEL_IS_EXTERNAL
 from mlflow.utils.uri import (
     append_to_uri_path,
-    get_uri_scheme,
     is_databricks_uri,
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def _is_uv_auto_detected() -> bool:
+    from mlflow.environment_variables import MLFLOW_UV_AUTO_DETECT
+    from mlflow.utils.uv_utils import detect_uv_project
+
+    return MLFLOW_UV_AUTO_DETECT.get() and detect_uv_project() is not None
+
 
 # NOTE: The MLMODEL_FILE_NAME constant is considered @developer_stable
 MLMODEL_FILE_NAME = "MLmodel"
@@ -75,15 +84,13 @@ _LOG_MODEL_METADATA_WARNING_TEMPLATE = (
 )
 _LOG_MODEL_MISSING_SIGNATURE_WARNING = (
     "Model logged without a signature. Signatures are required for Databricks UC model registry "
-    "as they validate model inputs and denote the expected schema of model outputs. "
-    f"Please visit https://www.mlflow.org/docs/{mlflow.__version__.replace('.dev0', '')}/"
-    "model/signatures.html#how-to-set-signatures-on-models for instructions on setting "
-    "signature on models."
+    "as they validate model inputs and denote the expected schema of model outputs. Please set "
+    "`input_example` parameter when logging the model to auto infer the model signature. To "
+    "manually set the signature, please visit https://www.mlflow.org/docs/"
+    f"{mlflow.__version__.replace('.dev0', '')}/ml/model/signatures.html for "
+    "instructions on setting signature on models."
 )
-_LOG_MODEL_MISSING_INPUT_EXAMPLE_WARNING = (
-    "Model logged without a signature and input example. Please set `input_example` parameter "
-    "when logging the model to auto infer the model signature."
-)
+
 # NOTE: The _MLFLOW_VERSION_KEY constant is considered @developer_stable
 _MLFLOW_VERSION_KEY = "mlflow_version"
 METADATA_FILES = [
@@ -117,15 +124,15 @@ class ModelInfo:
         model_uri: str,
         model_uuid: str,
         run_id: str,
-        saved_input_example_info: Optional[dict[str, Any]],
+        saved_input_example_info: dict[str, Any] | None,
         signature,  # Optional[ModelSignature]
         utc_time_created: str,
         mlflow_version: str,
-        metadata: Optional[dict[str, Any]] = None,
-        registered_model_version: Optional[int] = None,
-        env_vars: Optional[list[str]] = None,
-        prompts: Optional[list[str]] = None,
-        logged_model: Optional[LoggedModel] = None,
+        metadata: dict[str, Any] | None = None,
+        registered_model_version: int | None = None,
+        env_vars: list[str] | None = None,
+        prompts: list[str] | None = None,
+        logged_model: LoggedModel | None = None,
     ):
         self._artifact_path = artifact_path
         self._flavors = flavors
@@ -216,7 +223,7 @@ class ModelInfo:
         return self._run_id
 
     @property
-    def saved_input_example_info(self) -> Optional[dict[str, Any]]:
+    def saved_input_example_info(self) -> dict[str, Any] | None:
         """
         A dictionary that contains the metadata of the saved input example, e.g.,
         ``{"artifact_path": "input_example.json", "type": "dataframe", "pandas_orient": "split"}``.
@@ -258,7 +265,7 @@ class ModelInfo:
         return self._mlflow_version
 
     @property
-    def env_vars(self) -> Optional[list[str]]:
+    def env_vars(self) -> list[str] | None:
         """
         Environment variables used during the model logging process.
 
@@ -268,13 +275,13 @@ class ModelInfo:
         return self._env_vars
 
     @env_vars.setter
-    def env_vars(self, value: Optional[list[str]]) -> None:
+    def env_vars(self, value: list[str] | None) -> None:
         if value and not (isinstance(value, list) and all(isinstance(x, str) for x in value)):
             raise TypeError(f"env_vars must be a list of strings. Got: {value}")
         self._env_vars = value
 
     @property
-    def metadata(self) -> Optional[dict[str, Any]]:
+    def metadata(self) -> dict[str, Any] | None:
         """
         User defined metadata added to the model.
 
@@ -318,12 +325,12 @@ class ModelInfo:
         return self._metadata
 
     @property
-    def prompts(self) -> Optional[list[str]]:
+    def prompts(self) -> list[str] | None:
         """A list of prompt URIs associated with the model."""
         return self._prompts
 
     @property
-    def registered_model_version(self) -> Optional[int]:
+    def registered_model_version(self) -> int | None:
         """
         The registered model version, if the model is registered.
 
@@ -344,16 +351,16 @@ class ModelInfo:
 
         :getter: Gets the model ID of the logged model
         """
-        return self._logged_model.model_id
+        return self._logged_model.model_id if self._logged_model else None
 
     @property
-    def metrics(self) -> Optional[list[Metric]]:
+    def metrics(self) -> list[Metric] | None:
         """
         Returns the metrics of the logged model.
 
         :getter: Retrieves the metrics of the logged model
         """
-        return self._logged_model.metrics
+        return self._logged_model.metrics if self._logged_model else None
 
     @property
     def params(self) -> dict[str, str]:
@@ -362,7 +369,7 @@ class ModelInfo:
 
         :getter: Retrieves the parameters of the logged model
         """
-        return self._logged_model.params
+        return self._logged_model.params if self._logged_model else None
 
     @property
     def tags(self) -> dict[str, str]:
@@ -371,7 +378,7 @@ class ModelInfo:
 
         :getter: Retrieves the tags of the logged model
         """
-        return self._logged_model.tags
+        return self._logged_model.tags if self._logged_model else None
 
     @property
     def creation_timestamp(self) -> int:
@@ -380,14 +387,14 @@ class ModelInfo:
 
         :getter:  the creation timestamp of the logged model
         """
-        return self._logged_model.creation_timestamp
+        return self._logged_model.creation_timestamp if self._logged_model else None
 
     @property
     def name(self) -> str:
         """
         Returns the name of the logged model.
         """
-        return self._logged_model.name
+        return self._logged_model.name if self._logged_model else None
 
 
 class Model:
@@ -403,22 +410,26 @@ class Model:
         utc_time_created=None,
         flavors=None,
         signature=None,  # ModelSignature
-        saved_input_example_info: Optional[dict[str, Any]] = None,
-        model_uuid: Union[str, Callable, None] = lambda: uuid.uuid4().hex,
-        mlflow_version: Union[str, None] = mlflow.version.VERSION,
-        metadata: Optional[dict[str, Any]] = None,
-        model_size_bytes: Optional[int] = None,
-        resources: Optional[Union[str, list[Resource]]] = None,
-        env_vars: Optional[list[str]] = None,
-        auth_policy: Optional[AuthPolicy] = None,
-        model_id: Optional[str] = None,
-        prompts: Optional[list[str]] = None,
+        saved_input_example_info: dict[str, Any] | None = None,
+        model_uuid: str | Callable[[], str] | None = lambda: uuid.uuid4().hex,
+        mlflow_version: str | None = mlflow.version.VERSION,
+        metadata: dict[str, Any] | None = None,
+        model_size_bytes: int | None = None,
+        resources: str | list[Resource] | None = None,
+        env_vars: list[str] | None = None,
+        auth_policy: AuthPolicy | None = None,
+        model_id: str | None = None,
+        prompts: list[str] | None = None,
         **kwargs,
     ):
         # store model id instead of run_id and path to avoid confusion when model gets exported
         self.run_id = run_id
         self.artifact_path = artifact_path
-        self.utc_time_created = str(utc_time_created or datetime.utcnow())
+        self.utc_time_created = str(
+            # In mlflow <= 3.3.0, `datetime.utcnow()` was used. To preserve the original behavior,
+            # use `.replace(tzinfo=None)` to make the timestamp naive.
+            utc_time_created or datetime.now(timezone.utc).replace(tzinfo=None)
+        )
         self.flavors = flavors if flavors is not None else {}
         self.signature = signature
         self.saved_input_example_info = saved_input_example_info
@@ -457,7 +468,7 @@ class Model:
         """
         return getattr(self.signature, "params", None)
 
-    def get_serving_input(self, path: str) -> Optional[str]:
+    def get_serving_input(self, path: str) -> str | None:
         """
         Load serving input example from a model directory. Returns None if there is no serving input
         example.
@@ -472,7 +483,7 @@ class Model:
 
         return _load_serving_input_example(self, path)
 
-    def load_input_example(self, path: Optional[str] = None) -> Optional[str]:
+    def load_input_example(self, path: str | None = None) -> str | None:
         """
         Load the input example saved along a model. Returns None if there is no example metadata
         (i.e. the model was saved without example). Raises FileNotFoundError if there is model
@@ -522,7 +533,7 @@ class Model:
         return self
 
     @property
-    def metadata(self) -> Optional[dict[str, Any]]:
+    def metadata(self) -> dict[str, Any] | None:
         """
         Custom metadata dictionary passed to the model and stored in the MLmodel file.
 
@@ -566,7 +577,7 @@ class Model:
         return self._metadata
 
     @metadata.setter
-    def metadata(self, value: Optional[dict[str, Any]]) -> None:
+    def metadata(self, value: dict[str, Any] | None) -> None:
         self._metadata = value
 
     @property
@@ -591,7 +602,7 @@ class Model:
             self._signature = value
 
     @property
-    def saved_input_example_info(self) -> Optional[dict[str, Any]]:
+    def saved_input_example_info(self) -> dict[str, Any] | None:
         """
         A dictionary that contains the metadata of the saved input example, e.g.,
         ``{"artifact_path": "input_example.json", "type": "dataframe", "pandas_orient": "split"}``.
@@ -603,7 +614,7 @@ class Model:
         self._saved_input_example_info = value
 
     @property
-    def model_size_bytes(self) -> Optional[int]:
+    def model_size_bytes(self) -> int | None:
         """
         An optional integer that represents the model size in bytes
 
@@ -614,12 +625,11 @@ class Model:
         return self._model_size_bytes
 
     @model_size_bytes.setter
-    def model_size_bytes(self, value: Optional[int]) -> None:
+    def model_size_bytes(self, value: int | None) -> None:
         self._model_size_bytes = value
 
-    @experimental(version="2.13.0")
     @property
-    def resources(self) -> dict[str, dict[ResourceType, list[dict]]]:
+    def resources(self) -> dict[str, dict[ResourceType, list[dict[str, Any]]]]:
         """
         An optional dictionary that contains the resources required to serve the model.
 
@@ -629,9 +639,8 @@ class Model:
         """
         return self._resources
 
-    @experimental(version="2.13.0")
     @resources.setter
-    def resources(self, value: Optional[Union[str, list[Resource]]]) -> None:
+    def resources(self, value: str | list[Resource] | None) -> None:
         if isinstance(value, (Path, str)):
             serialized_resource = _ResourceBuilder.from_yaml_file(value)
         elif isinstance(value, list) and all(isinstance(resource, Resource) for resource in value):
@@ -640,9 +649,8 @@ class Model:
             serialized_resource = value
         self._resources = serialized_resource
 
-    @experimental(version="2.21.0")
     @property
-    def auth_policy(self) -> dict[str, dict]:
+    def auth_policy(self) -> dict[str, dict[str, Any]]:
         """
         An optional dictionary that contains the auth policy required to serve the model.
 
@@ -652,17 +660,16 @@ class Model:
         """
         return self._auth_policy
 
-    @experimental(version="2.21.0")
     @auth_policy.setter
-    def auth_policy(self, value: Optional[Union[dict, AuthPolicy]]) -> None:
+    def auth_policy(self, value: dict[str, Any] | AuthPolicy | None) -> None:
         self._auth_policy = value.to_dict() if isinstance(value, AuthPolicy) else value
 
     @property
-    def env_vars(self) -> Optional[list[str]]:
+    def env_vars(self) -> list[str] | None:
         return self._env_vars
 
     @env_vars.setter
-    def env_vars(self, value: Optional[list[str]]) -> None:
+    def env_vars(self, value: list[str] | None) -> None:
         if value and not (isinstance(value, list) and all(isinstance(x, str) for x in value)):
             raise TypeError(f"env_vars must be a list of strings. Got: {value}")
         self._env_vars = value
@@ -673,11 +680,13 @@ class Model:
     def _is_type_hint_from_example(self):
         return self.signature._is_type_hint_from_example if self.signature is not None else False
 
-    def get_model_info(self, logged_model: Optional[LoggedModel] = None) -> ModelInfo:
+    def get_model_info(self, logged_model: LoggedModel | None = None) -> ModelInfo:
         """
         Create a :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
         model metadata.
         """
+        if logged_model is None and self.model_id is not None:
+            logged_model = mlflow.get_logged_model(model_id=self.model_id)
         return ModelInfo(
             artifact_path=self.artifact_path,
             flavors=self.flavors,
@@ -721,8 +730,7 @@ class Model:
     def to_dict(self) -> dict[str, Any]:
         """Serialize the model to a dictionary."""
         res = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
-        databricks_runtime = get_databricks_runtime_version()
-        if databricks_runtime:
+        if databricks_runtime := get_databricks_runtime_version():
             res["databricks_runtime"] = databricks_runtime
         if self.signature is not None:
             res["signature"] = self.signature.to_dict()
@@ -919,23 +927,18 @@ class Model:
             serving_input = mlflow_model.get_serving_input(local_path)
             # We check signature presence here as some flavors have a default signature as a
             # fallback when not provided by user, which is set during flavor's save_model() call.
-            if mlflow_model.signature is None:
-                if serving_input is None:
-                    _logger.warning(
-                        _LOG_MODEL_MISSING_INPUT_EXAMPLE_WARNING, extra={"color": "red"}
-                    )
-                elif tracking_uri == "databricks" or get_uri_scheme(tracking_uri) == "databricks":
-                    _logger.warning(_LOG_MODEL_MISSING_SIGNATURE_WARNING, extra={"color": "red"})
+            if mlflow_model.signature is None and is_databricks_uri(tracking_uri):
+                _logger.info(_LOG_MODEL_MISSING_SIGNATURE_WARNING)
 
             env_vars = None
             # validate input example works for serving when logging the model
             if serving_input and kwargs.get("validate_serving_input", True):
-                from mlflow.models import validate_serving_input
+                from mlflow.models.utils import _validate_serving_input
                 from mlflow.utils.model_utils import RECORD_ENV_VAR_ALLOWLIST, env_var_tracker
 
                 with env_var_tracker() as tracked_env_names:
                     try:
-                        validate_serving_input(
+                        _validate_serving_input(
                             model_uri=local_path,
                             serving_input=serving_input,
                         )
@@ -948,10 +951,11 @@ class Model:
                             "Alternatively, you can avoid passing input example and pass model "
                             "signature instead when logging the model. To ensure the input example "
                             "is valid prior to serving, please try calling "
-                            "`mlflow.models.validate_serving_input` on the model uri and serving "
-                            "input example. A serving input example can be generated from model "
-                            "input example using "
-                            "`mlflow.models.convert_input_example_to_serving_input` function.\n"
+                            "`mlflow.models.predict(model_uri=..., input_data=serving_input, "
+                            'env_manager="uv")` on the model uri and serving input example. '
+                            "A serving input example can be generated from model input example "
+                            "using `mlflow.models.convert_input_example_to_serving_input` "
+                            "function.\n"
                             f"Got error: {e}",
                             exc_info=_logger.isEnabledFor(logging.DEBUG),
                         )
@@ -1066,12 +1070,12 @@ class Model:
         resources=None,
         auth_policy=None,
         prompts=None,
-        name: Optional[str] = None,
-        model_type: Optional[str] = None,
-        params: Optional[dict[str, Any]] = None,
-        tags: Optional[dict[str, Any]] = None,
+        name: str | None = None,
+        model_type: str | None = None,
+        params: dict[str, Any] | None = None,
+        tags: dict[str, Any] | None = None,
         step: int = 0,
-        model_id: Optional[str] = None,
+        model_id: str | None = None,
         **kwargs,
     ) -> ModelInfo:
         """
@@ -1122,22 +1126,20 @@ class Model:
             metrics_for_step = []
             for metric_name in metric_names:
                 history = client.get_metric_history(run_id, metric_name)
-                metrics_for_step.extend(
-                    [
-                        Metric(
-                            key=metric.key,
-                            value=metric.value,
-                            timestamp=metric.timestamp,
-                            step=metric.step,
-                            dataset_name=metric.dataset_name,
-                            dataset_digest=metric.dataset_digest,
-                            run_id=metric.run_id,
-                            model_id=model_id,
-                        )
-                        for metric in history
-                        if metric.step == step and metric.model_id is None
-                    ]
-                )
+                metrics_for_step.extend([
+                    Metric(
+                        key=metric.key,
+                        value=metric.value,
+                        timestamp=metric.timestamp,
+                        step=metric.step,
+                        dataset_name=metric.dataset_name,
+                        dataset_digest=metric.dataset_digest,
+                        run_id=metric.run_id,
+                        model_id=model_id,
+                    )
+                    for metric in history
+                    if metric.step == step and metric.model_id is None
+                ])
             client.log_batch(run_id=run_id, metrics=metrics_for_step)
 
         # Only one of Auth policy and resources should be defined
@@ -1154,6 +1156,7 @@ class Model:
             if not run_id:
                 run_id = active_run.info.run_id if (active_run := mlflow.active_run()) else None
 
+            flavor_name = kwargs.pop("flavor_name", None)
             if model_id is not None:
                 model = client.get_logged_model(model_id)
             else:
@@ -1161,7 +1164,9 @@ class Model:
                     **(params or {}),
                     **(client.get_run(run_id).data.params if run_id else {}),
                 }
-                model = mlflow.initialize_logged_model(
+                if flavor_name is None:
+                    flavor_name = flavor.__name__ if hasattr(flavor, "__name__") else "custom"
+                model = _create_logged_model(
                     # TODO: Update model name
                     name=name,
                     source_run_id=run_id,
@@ -1170,7 +1175,11 @@ class Model:
                     tags={key: str(value) for key, value in tags.items()}
                     if tags is not None
                     else None,
+                    flavor=flavor_name,
+                    serialization_format=kwargs.get("serialization_format"),
+                    uses_uv=kwargs.get("uv_project_path") is not None or _is_uv_auto_detected(),
                 )
+                _last_logged_model_id.set(model.model_id)
                 if (
                     MLFLOW_PRINT_MODEL_URLS_ON_CREATION.get()
                     and is_databricks_uri(tracking_uri)
@@ -1186,9 +1195,15 @@ class Model:
 
             with _use_logged_model(model=model):
                 if run_id is not None:
-                    client.log_outputs(
-                        run_id=run_id, models=[LoggedModelOutput(model.model_id, step=step)]
-                    )
+                    model_output = LoggedModelOutput(model.model_id, step=step)
+                    client.log_outputs(run_id=run_id, models=[model_output])
+                    # Update in-memory active run outputs to keep cached state in sync
+                    active_run = mlflow.active_run()
+                    if active_run is not None and active_run.info.run_id == run_id:
+                        if active_run.outputs is None:
+                            active_run._outputs = RunOutputs(model_outputs=[model_output])
+                        else:
+                            active_run.outputs.model_outputs.append(model_output)
                     log_model_metrics_for_step(
                         client=client, model_id=model.model_id, run_id=run_id, step=step
                     )
@@ -1220,27 +1235,22 @@ class Model:
                 # We check signature presence here as some flavors have a default signature as a
                 # fallback when not provided by user, which is set during flavor's save_model()
                 # call.
-                if mlflow_model.signature is None:
-                    if serving_input is None:
-                        _logger.warning(
-                            _LOG_MODEL_MISSING_INPUT_EXAMPLE_WARNING, extra={"color": "red"}
-                        )
-                    elif (
-                        tracking_uri == "databricks" or get_uri_scheme(tracking_uri) == "databricks"
-                    ):
-                        _logger.warning(
-                            _LOG_MODEL_MISSING_SIGNATURE_WARNING, extra={"color": "red"}
-                        )
+                if (
+                    mlflow_model.signature is None
+                    and serving_input is None
+                    and is_databricks_uri(tracking_uri)
+                ):
+                    _logger.info(_LOG_MODEL_MISSING_SIGNATURE_WARNING)
 
                 env_vars = None
                 # validate input example works for serving when logging the model
                 if serving_input and kwargs.get("validate_serving_input", True):
-                    from mlflow.models import validate_serving_input
+                    from mlflow.models.utils import _validate_serving_input
                     from mlflow.utils.model_utils import RECORD_ENV_VAR_ALLOWLIST, env_var_tracker
 
                     with env_var_tracker() as tracked_env_names:
                         try:
-                            validate_serving_input(
+                            _validate_serving_input(
                                 model_uri=local_path,
                                 serving_input=serving_input,
                             )
@@ -1255,9 +1265,10 @@ class Model:
                                 "Alternatively, you can avoid passing input example and pass model "
                                 "signature instead when logging the model. To ensure the input "
                                 "example is valid prior to serving, please try calling "
-                                "`mlflow.models.validate_serving_input` on the model uri and "
-                                "serving input example. A serving input example can be generated "
-                                "from model input example using "
+                                "`mlflow.models.predict(model_uri=..., input_data=serving_input, "
+                                'env_manager="uv")` on the model uri and serving input example. '
+                                "A serving input example can be generated from model input "
+                                "example using "
                                 "`mlflow.models.convert_input_example_to_serving_input` function.\n"
                                 f"Got error: {e}",
                                 exc_info=_logger.isEnabledFor(logging.DEBUG),
@@ -1298,11 +1309,21 @@ class Model:
                     client.delete_logged_model_tag(model.model_id, MLFLOW_MODEL_IS_EXTERNAL)
                 # client.finalize_logged_model(model.model_id, status=LoggedModelStatus.READY)
 
-                # Associate prompts to the model Run
-                if prompts and run_id:
+                # Associate prompts to the model Run and LoggedModel
+                if prompts:
                     client = mlflow.MlflowClient()
-                    for prompt in prompts:
-                        client.link_prompt_version_to_run(run_id, prompt)
+                    for prompt_uri in prompts:
+                        # Link to run (handles both URIs and PromptVersion objects)
+                        if run_id:
+                            client.link_prompt_version_to_run(run_id, prompt_uri)
+
+                        # Link to LoggedModel - load prompt to get name/version
+                        prompt_obj = client.load_prompt(prompt_uri)
+                        client.link_prompt_version_to_model(
+                            name=prompt_obj.name,
+                            version=prompt_obj.version,
+                            model_id=model.model_id,
+                        )
 
                 # if the model_config kwarg is passed in, then log the model config as an params
                 if model_config := kwargs.get("model_config"):
@@ -1355,6 +1376,7 @@ class Model:
                     registered_model_name,
                     await_registration_for=await_registration_for,
                     local_model_path=local_path,
+                    tags=tags,
                 )
             model_info = mlflow_model.get_model_info(model)
             if registered_model is not None:
@@ -1432,7 +1454,8 @@ def get_model_info(model_uri: str) -> ModelInfo:
 
         with mlflow.start_run() as run:
             params = {"n_estimators": 3, "random_state": 42}
-            X, y = [[0, 1]], [1]
+            X = [[0, 1]]
+            y = [1]
             signature = mlflow.models.infer_signature(X, y)
             rfr = RandomForestRegressor(**params).fit(X, y)
             mlflow.log_params(params)
@@ -1591,7 +1614,6 @@ def _validate_llama_index_model(model):
     return _validate_and_prepare_llama_index_model_or_path(model, None)
 
 
-@experimental(version="2.13.0")
 def set_model(model) -> None:
     """
     When logging model as code, this function can be used to set the model object

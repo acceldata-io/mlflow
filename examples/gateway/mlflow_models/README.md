@@ -56,17 +56,16 @@ model = SentenceTransformer(model_name_or_path="all-MiniLM-L6-v2")
 artifact_path = "embeddings_model"
 
 with mlflow.start_run():
-    mlflow.sentence_transformers.log_model(
+    model_info = mlflow.sentence_transformers.log_model(
         model,
         name=artifact_path,
     )
-    model_uri = mlflow.get_artifact_uri(artifact_path)
 ```
 
 ## Generate the cli command for starting a local MLflow Model Serving endpoint for this embeddings model
 
 ```python
-print(f"mlflow models serve -m {model_uri} -h 127.0.0.1 -p 9020 --no-conda")
+print(f"mlflow models serve -m {model_info.model_uri} -h 127.0.0.1 -p 9020 --no-conda")
 ```
 
 Copy the output from the print statement to the clipboard.
@@ -132,17 +131,16 @@ model = AutoModelForMaskedLM.from_pretrained(lm_architecture)
 components = {"model": model, "tokenizer": tokenizer}
 
 with mlflow.start_run():
-    mlflow.transformers.log_model(
+    model_info = mlflow.transformers.log_model(
         transformers_model=components,
         name=artifact_path,
     )
-    model_uri = mlflow.get_artifact_uri(artifact_path)
 ```
 
 ## Generate the cli command for starting a local MLflow Model Serving endpoint for this fill mask model
 
 ```python
-print(f"mlflow models serve -m {model_uri} -h 127.0.0.1 -p 9010 --no-conda")
+print(f"mlflow models serve -m {model_info.model_uri} -h 127.0.0.1 -p 9010 --no-conda")
 ```
 
 ## Starting the model server for the fill mask model
@@ -180,9 +178,7 @@ Add the entry to the MLflow AI Gateway configuration file. The final file should
 ```python
 from huggingface_hub import snapshot_download
 
-snapshot_location = snapshot_download(
-    repo_id="mosaicml/mpt-7b-instruct", local_dir="mpt-7b"
-)
+snapshot_location = snapshot_download(repo_id="mosaicml/mpt-7b-instruct", local_dir="mpt-7b")
 ```
 
 ### Define the PyFunc model that will be used for the completions endpoint
@@ -285,21 +281,21 @@ from mlflow.models.signature import ModelSignature
 from mlflow.types import DataType, Schema, ColSpec
 
 # Define input and output schema
-input_schema = Schema(
-    [
-        ColSpec(DataType.string, "prompt"),
-        ColSpec(DataType.double, "temperature"),
-        ColSpec(DataType.long, "max_tokens"),
-    ]
-)
+input_schema = Schema([
+    ColSpec(DataType.string, "prompt"),
+    ColSpec(DataType.double, "temperature"),
+    ColSpec(DataType.long, "max_tokens"),
+])
 output_schema = Schema([ColSpec(DataType.string, "candidates")])
 signature = ModelSignature(inputs=input_schema, outputs=output_schema)
 
 
 # Define input example
-input_example = pd.DataFrame(
-    {"prompt": ["What is machine learning?"], "temperature": [0.5], "max_tokens": [100]}
-)
+input_example = pd.DataFrame({
+    "prompt": ["What is machine learning?"],
+    "temperature": [0.5],
+    "max_tokens": [100],
+})
 
 with mlflow.start_run():
     mlflow.pyfunc.log_model(

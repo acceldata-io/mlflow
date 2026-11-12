@@ -3,6 +3,7 @@ import codecs
 import errno
 import fnmatch
 import gzip
+import importlib.util
 import json
 import logging
 import math
@@ -18,12 +19,12 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
-import uuid
 from concurrent.futures import as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from subprocess import CalledProcessError, TimeoutExpired
-from typing import Any, Optional, Union
+from types import TracebackType
+from typing import Any
 from urllib.parse import unquote
 from urllib.request import pathname2url
 
@@ -51,6 +52,13 @@ ENCODING = "utf-8"
 _PROGRESS_BAR_DISPLAY_THRESHOLD = 500_000_000  # 500 MB
 
 _logger = logging.getLogger(__name__)
+
+# This is for backward compatibility with databricks-feature-engineering<=0.10.2
+if importlib.util.find_spec("yaml") is not None:
+    try:
+        from yaml import CSafeDumper as YamlSafeDumper
+    except ImportError:
+        from yaml import SafeDumper as YamlSafeDumper  # noqa: F401
 
 
 class ArtifactProgressBar:
@@ -212,39 +220,6 @@ def make_containing_dirs(path):
         os.makedirs(dir_name)
 
 
-def read_parquet_as_pandas_df(data_parquet_path: str):
-    """Deserialize and load the specified parquet file as a Pandas DataFrame.
-
-    Args:
-        data_parquet_path: String, path object (implementing os.PathLike[str]),
-            or file-like object implementing a binary read() function. The string
-            could be a URL. Valid URL schemes include http, ftp, s3, gs, and file.
-            For file URLs, a host is expected. A local file could
-            be: file://localhost/path/to/table.parquet. A file URL can also be a path to a
-            directory that contains multiple partitioned parquet files. Pyarrow
-            support paths to directories as well as file URLs. A directory
-            path could be: file://localhost/path/to/tables or s3://bucket/partition_dir.
-
-    Returns:
-        pandas dataframe
-    """
-    import pandas as pd
-
-    return pd.read_parquet(data_parquet_path, engine="pyarrow")
-
-
-def write_pandas_df_as_parquet(df, data_parquet_path: str):
-    """Write a DataFrame to the binary parquet format.
-
-    Args:
-        df: pandas data frame.
-        data_parquet_path: String, path object (implementing os.PathLike[str]),
-            or file-like object implementing a binary write() function.
-
-    """
-    df.to_parquet(data_parquet_path, engine="pyarrow")
-
-
 class TempDir:
     def __init__(self, chdr=False, remove_on_exit=True):
         self._dir = None
@@ -321,22 +296,6 @@ def get_file_info(path, rel_path):
         return FileInfo(rel_path, False, os.path.getsize(path))
 
 
-def get_relative_path(root_path, target_path):
-    """Remove root path common prefix and return part of `path` relative to `root_path`.
-
-    Args:
-        root_path: Root path.
-        target_path: Desired path for common prefix removal.
-
-    Returns:
-        Path relative to root_path.
-    """
-    if len(root_path) > len(target_path):
-        raise Exception(f"Root path '{root_path}' longer than target path '{target_path}'")
-    common_prefix = os.path.commonprefix([root_path, target_path])
-    return os.path.relpath(target_path, common_prefix)
-
-
 def mv(target, new_parent):
     shutil.move(target, new_parent)
 
@@ -393,7 +352,7 @@ def _copy_project(src_path, dst_path=""):
         patterns = []
         if os.path.exists(docker_ignore):
             with open(docker_ignore) as f:
-                patterns = [x.strip() for x in f.readlines()]
+                patterns = [x.strip() for x in f]
 
         def ignore(_, names):
             res = set()
@@ -509,19 +468,6 @@ def get_local_path_or_none(path_or_uri):
         return local_file_uri_to_path(path_or_uri)
     else:
         return None
-
-
-def yield_file_in_chunks(file, chunk_size=100000000):
-    """
-    Generator to chunk-ify the inputted file based on the chunk-size.
-    """
-    with open(file, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if chunk:
-                yield chunk
-            else:
-                break
 
 
 def download_file_using_http_uri(http_uri, download_path, chunk_size=100000000, headers=None):
@@ -749,8 +695,10 @@ def get_or_create_tmp_dir():
     else:
         tmp_dir = tempfile.mkdtemp()
         # mkdtemp creates a directory with permission 0o700
-        # change it to be 0o777 to ensure it can be seen in spark UDF
-        os.chmod(tmp_dir, 0o777)
+        # For Spark UDFs, we need to make it accessible to other processes
+        # Use 0o750 (owner: rwx, group: r-x, others: None) instead of 0o777
+        # This allows read/execute but not write for group and others
+        os.chmod(tmp_dir, 0o750)
         atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
 
     return tmp_dir
@@ -782,30 +730,12 @@ def get_or_create_nfs_tmp_dir():
     else:
         tmp_nfs_dir = tempfile.mkdtemp(dir=nfs_root_dir)
         # mkdtemp creates a directory with permission 0o700
-        # change it to be 0o777 to ensure it can be seen in spark UDF
-        os.chmod(tmp_nfs_dir, 0o777)
+        # For Spark UDFs, we need to make it accessible to other processes
+        # Use 0o750 (owner: rwx, group: r-x, others: None) instead of 0o777
+        os.chmod(tmp_nfs_dir, 0o750)
         atexit.register(shutil.rmtree, tmp_nfs_dir, ignore_errors=True)
 
     return tmp_nfs_dir
-
-
-def write_spark_dataframe_to_parquet_on_local_disk(spark_df, output_path):
-    """Write spark dataframe in parquet format to local disk.
-
-    Args:
-        spark_df: Spark dataframe.
-        output_path: Path to write the data to.
-
-    """
-    from mlflow.utils.databricks_utils import is_in_databricks_runtime
-
-    if is_in_databricks_runtime():
-        dbfs_path = os.path.join(".mlflow", "cache", str(uuid.uuid4()))
-        spark_df.coalesce(1).write.format("parquet").save(dbfs_path)
-        shutil.copytree("/dbfs/" + dbfs_path, output_path)
-        shutil.rmtree("/dbfs/" + dbfs_path)
-    else:
-        spark_df.coalesce(1).write.format("parquet").save(output_path)
 
 
 def shutil_copytree_without_file_permissions(src_dir, dst_dir):
@@ -818,7 +748,8 @@ def shutil_copytree_without_file_permissions(src_dir, dst_dir):
             # For each directory <dirname> immediately under <dirpath>, create an equivalently-named
             # directory under the destination directory
             abs_dir_path = os.path.join(dst_dir, relative_dir_path)
-            os.mkdir(abs_dir_path)
+            if not os.path.exists(abs_dir_path):
+                os.mkdir(abs_dir_path)
         for filename in filenames:
             # For each file with name <filename> immediately under <dirpath>, copy that file to
             # the appropriate location in the destination directory
@@ -888,22 +819,7 @@ def remove_on_error(path: os.PathLike, onerror=None):
         raise
 
 
-@contextmanager
-def chdir(path: str) -> None:
-    """Temporarily change the current working directory to the specified path.
-
-    Args:
-        path: The path to use as the temporary working directory.
-    """
-    cwd = os.getcwd()
-    try:
-        os.chdir(path)
-        yield
-    finally:
-        os.chdir(cwd)
-
-
-def get_total_file_size(path: Union[str, pathlib.Path]) -> Optional[int]:
+def get_total_file_size(path: str | pathlib.Path) -> int | None:
     """Return the size of all files under given path, including files in subdirectories.
 
     Args:
@@ -928,7 +844,7 @@ def get_total_file_size(path: Union[str, pathlib.Path]) -> Optional[int]:
         total_size = 0
         for cur_path, dirs, files in os.walk(path):
             full_paths = [os.path.join(cur_path, file) for file in files]
-            total_size += sum([os.path.getsize(file) for file in full_paths])
+            total_size += sum(map(os.path.getsize, full_paths))
         return total_size
     except Exception as e:
         _logger.info(f"Failed to get the total size of {path} because of error :{e}")
@@ -968,3 +884,103 @@ def read_yaml(root: str, file_name: str) -> dict[str, Any]:
 
     with open(os.path.join(root, file_name)) as f:
         return yaml.safe_load(f)
+
+
+class ExclusiveFileLock:
+    """
+    Exclusive file lock (only works on Unix system)
+    """
+
+    def __init__(self, path: str):
+        if os.name == "nt":
+            raise MlflowException("ExclusiveFileLock class does not support Windows system.")
+        self.path = path
+        self.fd = None
+
+    def __enter__(self) -> None:
+        # Python on Windows does not have `fcntl` module, so importing it lazily.
+        import fcntl  # clint: disable=lazy-import
+
+        # Open file (create if missing)
+        self.fd = open(self.path, "w")
+        # Acquire exclusive lock (blocking)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ):
+        # Python on Windows does not have `fcntl` module, so importing it lazily.
+        import fcntl  # clint: disable=lazy-import
+
+        # Release lock
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        self.fd.close()
+
+
+def check_tarfile_security(archive_path: str) -> None:
+    """
+    Check the tar file content.
+    If its members contain any of the following paths:
+     * An absolute path.
+     * A relative path that escapes the extraction directory.
+     * A relative path that goes through a symlink.
+    then raise an error.
+    """
+    with tarfile.open(archive_path, "r") as tar:
+        symlink_set = set()
+        for m in tar.getmembers():
+            # Normalize backslashes to forward slashes before path validation to prevent
+            # bypass on Windows where backslashes are treated as directory separators.
+            path = posixpath.normpath(m.name.replace("\\", "/"))
+            _check_path_is_safe(path)
+            if m.issym():
+                symlink_set.add(path)
+            elif m.islnk():
+                symlink_set.add(path)
+                # Hard link targets are dangerous: tar.extract creates an actual hard
+                # link to the target path, so validate they don't escape.
+                link_target = posixpath.normpath(m.linkname.replace("\\", "/"))
+                _check_path_is_safe(link_target, context=f"hard link target of {path}")
+                link_parent = posixpath.dirname(path)
+                resolved = posixpath.normpath(posixpath.join(link_parent, link_target))
+                if resolved == ".." or resolved.startswith("../"):
+                    raise MlflowException.invalid_parameter_value(
+                        "Hard link target that escapes the extraction directory is not "
+                        f"allowed, but got {path} -> {link_target}."
+                    )
+        for m in tar.getmembers():
+            if not m.issym() and not m.islnk():
+                path = posixpath.normpath(m.name.replace("\\", "/"))
+                path_parts = path.split("/")
+                for prefix_len in range(1, len(path_parts) + 1):
+                    prefix_path = "/".join(path_parts[:prefix_len])
+                    if prefix_path in symlink_set:
+                        raise MlflowException.invalid_parameter_value(
+                            "Destination path in the archive file can not go through a symlink, "
+                            f"but got path {path}."
+                        )
+
+
+def _check_path_is_safe(path: str, context: str = "") -> None:
+    label = f" ({context})" if context else ""
+    # Reject Unix absolute paths
+    if path.startswith("/"):
+        raise MlflowException.invalid_parameter_value(
+            f"Absolute path destination in the archive file is not allowed, "
+            f"but got path {path}{label}."
+        )
+    # Reject Windows drive-letter absolute paths (e.g., C:/...) and UNC paths (//server/...)
+    if len(path) >= 3 and path[0].isalpha() and path[1:3] == ":/":
+        raise MlflowException.invalid_parameter_value(
+            f"Absolute path destination in the archive file is not allowed, "
+            f"but got path {path}{label}."
+        )
+    path_parts = path.split("/")
+    if path_parts[0] == "..":
+        raise MlflowException.invalid_parameter_value(
+            f"Escaped path destination in the archive file is not allowed, "
+            f"but got path {path}{label}."
+        )

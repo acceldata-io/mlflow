@@ -6,12 +6,14 @@
  */
 
 import React, { Component } from 'react';
-import { Alert, Button, LegacyTooltip, useDesignSystemTheme } from '@databricks/design-system';
+import { Alert, Button, Tooltip, useDesignSystemTheme } from '@databricks/design-system';
 import { Prompt } from './Prompt';
+import 'react-mde/lib/styles/css/react-mde-all.css';
 import ReactMde, { SvgIcon } from 'react-mde';
 import { forceAnchorTagNewTab, getMarkdownConverter, sanitizeConvertedHtml } from '../utils/MarkdownUtils';
 import './EditableNote.css';
-import { FormattedMessage, IntlShape, injectIntl } from 'react-intl';
+import type { IntlShape } from 'react-intl';
+import { FormattedMessage, injectIntl } from 'react-intl';
 
 type EditableNoteImplProps = {
   defaultMarkdown?: string;
@@ -57,6 +59,18 @@ export class EditableNoteImpl extends Component<EditableNoteImplProps, EditableN
   };
 
   converter = getMarkdownConverter();
+
+  componentDidUpdate(prevProps: EditableNoteImplProps) {
+    if (
+      prevProps.defaultMarkdown !== this.props.defaultMarkdown ||
+      prevProps.defaultSelectedTab !== this.props.defaultSelectedTab
+    ) {
+      this.setState({
+        markdown: this.props.defaultMarkdown,
+        selectedTab: this.props.defaultSelectedTab,
+      });
+    }
+  }
 
   handleMdeValueChange = (markdown: any) => {
     this.setState({ markdown });
@@ -111,7 +125,7 @@ export class EditableNoteImpl extends Component<EditableNoteImplProps, EditableN
     // @ts-expect-error TS(2339): Property 'confirmLoading' does not exist on type '... Remove this comment to see the full error message
     const { confirmLoading } = this.state;
     return (
-      <div className="editable-note-actions" data-testid="editable-note-actions">
+      <div className="mlflow-editable-note-actions" data-testid="editable-note-actions">
         <div>
           <Button
             componentId="codegen_mlflow_app_src_common_components_editablenote.tsx_114"
@@ -159,8 +173,8 @@ export class EditableNoteImpl extends Component<EditableNoteImplProps, EditableN
         {showEditor ? (
           <React.Fragment>
             <div className="note-view-text-area">
-              <ReactMde
-                value={markdown}
+              <ThemeAwareReactMde
+                value={markdown || ''}
                 minEditorHeight={this.props.minEditorHeight}
                 maxEditorHeight={this.props.maxEditorHeight}
                 minPreviewHeight={50}
@@ -212,13 +226,39 @@ function TooltipIcon(props: TooltipIconProps) {
   const { theme } = useDesignSystemTheme();
   const { name } = props;
   return (
-    // @ts-expect-error TS(2322): Type '{ children: Element; position: string; title... Remove this comment to see the full error message
-    <LegacyTooltip position="top" title={name}>
+    <Tooltip side="top" content={name} componentId="mlflow.common.components.editable-note.tooltip-icon">
       <span css={{ color: theme.colors.textPrimary }}>
         {/* @ts-expect-error TS(2322): Type 'string | undefined' is not assignable to typ... Remove this comment to see the full error message */}
         <SvgIcon icon={name} />
       </span>
-    </LegacyTooltip>
+    </Tooltip>
+  );
+}
+
+type ThemeAwareReactMdeProps = React.ComponentProps<typeof ReactMde>;
+
+export function ThemeAwareReactMde(props: ThemeAwareReactMdeProps) {
+  const { theme } = useDesignSystemTheme();
+
+  // Apply theme-aware CSS variables for ReactMde
+  const themeAwareStyle = React.useMemo(
+    () =>
+      ({
+        '--mlflow-dark-bg-primary': theme.colors.backgroundPrimary,
+        '--mlflow-dark-bg-secondary': theme.colors.backgroundSecondary,
+        '--mlflow-dark-bg-hover': theme.colors.actionDefaultBackgroundHover,
+        '--mlflow-dark-text-primary': theme.colors.textPrimary,
+        '--mlflow-dark-border': theme.colors.border,
+      }) as React.CSSProperties,
+    [theme],
+  );
+
+  const isDarkTheme = theme.isDarkMode;
+
+  return (
+    <div className={isDarkTheme ? 'mlflow-dark-theme' : ''} style={themeAwareStyle}>
+      <ReactMde {...props} />
+    </div>
   );
 }
 
@@ -238,7 +278,7 @@ function HTMLNoteContent(props: HTMLNoteContentProps) {
             // @ts-expect-error TS(2322): Type 'string | undefined' is not assignable to typ... Remove this comment to see the full error message
             // eslint-disable-next-line react/no-danger
             dangerouslySetInnerHTML={{ __html: props.content }}
-          ></div>
+          />
         </div>
       </div>
     </div>

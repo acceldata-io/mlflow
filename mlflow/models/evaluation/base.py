@@ -5,14 +5,13 @@ import logging
 import os
 import pathlib
 import signal
-import urllib
 import urllib.parse
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from inspect import Parameter, Signature
 from types import FunctionType
-from typing import Any, Optional, Union
+from typing import Any
 
 import mlflow
 from mlflow.data.dataset import Dataset
@@ -27,6 +26,8 @@ from mlflow.exceptions import MlflowException
 from mlflow.models.evaluation.utils.trace import configure_autologging_for_evaluation
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.store.artifact.utils.models import _parse_model_id_if_present
+from mlflow.telemetry.events import EvaluateEvent
+from mlflow.telemetry.track import record_usage_event
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.tracking.client import MlflowClient
 from mlflow.tracking.fluent import _set_active_model
@@ -198,9 +199,9 @@ def _generate_eval_metric_class(eval_fn, require_strict_signature=False):
         def genai_call_method(
             self,
             *,
-            predictions: Union[pd.Series, str, list[str]],
-            inputs: Union[pd.Series, str, list[str]],
-            metrics: Optional[dict[str, MetricValue]] = None,
+            predictions: pd.Series | str | list[str],
+            inputs: pd.Series | str | list[str],
+            metrics: dict[str, MetricValue] | None = None,
             **kwargs,
         ) -> MetricValue:
             if missed_kwargs := set(allowed_kwargs_names) - set(kwargs.keys()):
@@ -230,23 +231,21 @@ def _generate_eval_metric_class(eval_fn, require_strict_signature=False):
                 Parameter(
                     "predictions",
                     Parameter.KEYWORD_ONLY,
-                    annotation=Union[pd.Series, str, list[str]],
+                    annotation=pd.Series | str | list[str],
                 ),
                 Parameter(
                     "inputs",
                     Parameter.KEYWORD_ONLY,
-                    annotation=Union[pd.Series, str, list[str]],
+                    annotation=pd.Series | str | list[str],
                 ),
                 Parameter(
                     "metrics",
                     Parameter.KEYWORD_ONLY,
-                    annotation=Optional[dict[str, MetricValue]],
+                    annotation=dict[str, MetricValue] | None,
                     default=None,
                 ),
                 *[
-                    Parameter(
-                        name, Parameter.KEYWORD_ONLY, annotation=Union[pd.Series, str, list[str]]
-                    )
+                    Parameter(name, Parameter.KEYWORD_ONLY, annotation=pd.Series | str | list[str])
                     for name in allowed_kwargs_names
                 ],
             ]
@@ -772,7 +771,7 @@ def list_evaluators():
 def _start_run_or_reuse_active_run():
     """
     A manager context return:
-     - If there's an active run, return the active run id.
+     - If there's an active run, return the active run.
      - otherwise start a mflow run with the specified run_id,
        if specified run_id is None, start a new run.
     """
@@ -780,9 +779,9 @@ def _start_run_or_reuse_active_run():
     if not active_run:
         # Note `mlflow.start_run` throws if `run_id` is not found.
         with mlflow.start_run() as run:
-            yield run.info.run_id
+            yield run
     else:
-        yield active_run.info.run_id
+        yield active_run
 
 
 # NB: We often pass around evaluator name, config, and its instance together. Ideally, the
@@ -831,9 +830,9 @@ def _resolve_default_evaluator(model_type, default_config) -> list[EvaluatorBund
 
 
 def resolve_evaluators_and_configs(
-    evaluators: Union[str, list[str], None],
-    evaluator_config: Union[dict[str, Any], None],
-    model_type: Optional[str] = None,
+    evaluators: str | list[str] | None,
+    evaluator_config: dict[str, Any] | None,
+    model_type: str | None = None,
 ) -> list[EvaluatorBundle]:
     """
     The `evaluators` and `evaluator_config` arguments of the `evaluate` API can be specified
@@ -883,7 +882,7 @@ def resolve_evaluators_and_configs(
             # If evaluator config is passed but any of available evaluator key is not
             # in the evaluator config, we assume the evaluator config to be a flat dict,
             # which is globally applied to all evaluators.
-            evaluator_config = {ev: evaluator_config for ev in evaluators}
+            evaluator_config = dict.fromkeys(evaluators, evaluator_config)
 
         # Filter out evaluators that cannot evaluate the model type.
         resolved = []
@@ -990,6 +989,7 @@ def _get_last_failed_evaluator():
 # DO NOT CHANGE THE ORDER OF THE ARGUMENTS
 # The order of the arguments need to be preserved. You can add new arguments at the end
 # of the argument list, but do not change the order of the existing arguments.
+@record_usage_event(EvaluateEvent)
 def _evaluate(
     *,
     model,
@@ -1080,13 +1080,13 @@ def _is_model_deployment_endpoint_uri(model: Any) -> bool:
 
     try:
         schema, path = _parse_model_uri(model)
-        return schema == "endpoints"
+        return schema in ["endpoints", "apps"]
     except MlflowException:
         return False
 
 
 def _get_model_from_deployment_endpoint_uri(
-    endpoint_uri: str, params: Optional[dict[str, Any]] = None
+    endpoint_uri: str, params: dict[str, Any] | None = None
 ):
     from mlflow.metrics.genai.model_utils import _parse_model_uri
     from mlflow.pyfunc.model import ModelFromDeploymentEndpoint, _PythonModelPyfuncWrapper
@@ -1098,7 +1098,7 @@ def _get_model_from_deployment_endpoint_uri(
     return _PythonModelPyfuncWrapper(python_model, None, None)
 
 
-def evaluate(  # noqa: D417
+def evaluate(
     model=None,
     data=None,
     *,
@@ -1371,7 +1371,7 @@ def evaluate(  # noqa: D417
             - A Pandas DataFrame containing evaluation features, labels, and optionally model
                 outputs. Model outputs are required to be provided when model is unspecified.
                 If ``feature_names`` argument not specified, all columns except for the label
-                column and model_output column are regarded as feature columns. Otherwise,
+                column and predictions column are regarded as feature columns. Otherwise,
                 only column names present in ``feature_names`` are regarded as feature columns.
             -  A Spark DataFrame containing evaluation features and labels. If
                 ``feature_names`` argument not specified, all columns except for the label
@@ -1381,7 +1381,7 @@ def evaluate(  # noqa: D417
             - A :py:class:`mlflow.data.dataset.Dataset` instance containing evaluation
                 features, labels, and optionally model outputs. Model outputs are only supported
                 with a PandasDataset. Model outputs are required when model is unspecified, and
-                should be specified via the ``predictions`` prerty of the PandasDataset.
+                should be specified via the ``predictions`` property of the PandasDataset.
 
         model_type: (Optional) A string describing the model type. The default evaluator
             supports the following model types:
@@ -1393,7 +1393,7 @@ def evaluate(  # noqa: D417
             - ``'text'``
             - ``'retriever'``
 
-            If no ``model_type`` is specified, then you must provide a a list of
+            If no ``model_type`` is specified, then you must provide a list of
             metrics to compute via the ``extra_metrics`` param.
 
             .. note::
@@ -1740,7 +1740,7 @@ def evaluate(  # noqa: D417
     evaluator_name_list = [evaluator.name for evaluator in evaluators]
     evaluator_name_to_conf_map = {evaluator.name: evaluator.config for evaluator in evaluators}
 
-    with _start_run_or_reuse_active_run() as run_id:
+    with _start_run_or_reuse_active_run() as run:
         if not isinstance(data, Dataset):
             # Convert data to `mlflow.data.dataset.Dataset`.
             if model is None:
@@ -1759,7 +1759,7 @@ def evaluate(  # noqa: D417
             ):
                 dataset = data.to_evaluation_dataset(dataset_path, feature_names)
 
-                # Use metrix_prefix configured for builtin evaluators as a dataset tag
+                # Use metric_prefix configured for builtin evaluators as a dataset tag
                 context = None
                 for e in evaluators:
                     if _model_evaluation_registry.is_builtin(e.name) and e.config.get(
@@ -1772,7 +1772,7 @@ def evaluate(  # noqa: D417
                 tags = [InputTag(key=MLFLOW_DATASET_CONTEXT, value=context)] if context else []
                 dataset_input = DatasetInput(dataset=data._to_mlflow_entity(), tags=tags)
                 client.log_inputs(
-                    run_id,
+                    run.info.run_id,
                     [dataset_input],
                     models=[LoggedModelInput(model_id)] if model_id else None,
                 )
@@ -1792,7 +1792,7 @@ def evaluate(  # noqa: D417
                     model_type=model_type,
                     model_id=model_id,
                     dataset=dataset,
-                    run_id=run_id,
+                    run_id=run.info.run_id,
                     evaluator_name_list=evaluator_name_list,
                     evaluator_name_to_conf_map=evaluator_name_to_conf_map,
                     extra_metrics=extra_metrics,

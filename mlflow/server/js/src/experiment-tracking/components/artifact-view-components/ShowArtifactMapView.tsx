@@ -15,13 +15,14 @@ import iconRetina from 'leaflet/dist/images/marker-icon-2x.png';
 import iconShadow from 'leaflet/dist/images/marker-shadow.png';
 import { ArtifactViewSkeleton } from './ArtifactViewSkeleton';
 import { ArtifactViewErrorState } from './ArtifactViewErrorState';
-import { LoggedModelArtifactViewerProps } from './ArtifactViewComponents.types';
+import type { LoggedModelArtifactViewerProps } from './ArtifactViewComponents.types';
 import { fetchArtifactUnified, type FetchArtifactUnifiedFn } from './utils/fetchArtifactUnified';
+import sanitizeHtml from 'sanitize-html';
 
 function onEachFeature(feature: any, layer: any) {
   if (feature.properties && feature.properties.popupContent) {
     const { popupContent } = feature.properties;
-    layer.bindPopup(popupContent);
+    layer.bindPopup(sanitizeHtml(popupContent));
   }
 }
 
@@ -129,7 +130,7 @@ class ShowArtifactMapView extends Component<Props, State> {
             ref={(ref) => {
               this.mapRef = ref;
             }}
-          ></div>
+          />
         </div>
       );
     }
@@ -137,10 +138,10 @@ class ShowArtifactMapView extends Component<Props, State> {
 
   /** Fetches artifacts and updates component state with the result */
   fetchArtifacts() {
-    const { path, runUuid, isLoggedModelsMode, loggedModelId, experimentId } = this.props;
+    const { path, runUuid, isLoggedModelsMode, loggedModelId, experimentId, entityTags } = this.props;
 
     this.props
-      .getArtifact?.({ path, runUuid, isLoggedModelsMode, loggedModelId, experimentId }, getArtifactContent)
+      .getArtifact?.({ path, runUuid, isLoggedModelsMode, loggedModelId, experimentId, entityTags }, getArtifactContent)
       .then((rawFeatures: any) => {
         const parsedFeatures = JSON.parse(rawFeatures);
         this.setState({ features: parsedFeatures, loading: false });

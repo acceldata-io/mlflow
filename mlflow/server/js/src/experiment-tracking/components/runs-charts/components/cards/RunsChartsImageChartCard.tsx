@@ -1,13 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { RunsChartsRunData } from '../RunsCharts.common';
-import {
-  type RunsChartCardReorderProps,
-  RunsChartCardWrapper,
-  RunsChartsChartsDragGroup,
-  RunsChartCardFullScreenProps,
-} from './ChartCard.common';
+import type { RunsChartCardFullScreenProps } from './ChartCard.common';
+import { type RunsChartCardReorderProps, RunsChartCardWrapper, RunsChartsChartsDragGroup } from './ChartCard.common';
 import { useConfirmChartCardConfigurationFn } from '../../hooks/useRunsChartsUIConfiguration';
-import { RunsChartsCardConfig, RunsChartsImageCardConfig } from '../../runs-charts.types';
+import type { RunsChartsCardConfig, RunsChartsImageCardConfig } from '../../runs-charts.types';
 import { ImageGridPlot } from '../charts/ImageGridPlot';
 import { useDesignSystemTheme } from '@databricks/design-system';
 import { useImageSliderStepMarks } from '../../hooks/useImageSliderStepMarks';
@@ -17,7 +13,9 @@ import {
   NUM_RUNS_TO_SUPPORT_FOR_LOG_IMAGE,
 } from '@mlflow/mlflow/src/experiment-tracking/constants';
 import { LineSmoothSlider } from '@mlflow/mlflow/src/experiment-tracking/components/LineSmoothSlider';
-import { RunsGroupByConfig } from '@mlflow/mlflow/src/experiment-tracking/components/experiment-page/utils/experimentPage.group-row-utils';
+import type { RunsGroupByConfig } from '@mlflow/mlflow/src/experiment-tracking/components/experiment-page/utils/experimentPage.group-row-utils';
+
+const IMAGE_CHART_CARD_HEIGHT = 600;
 
 export interface RunsChartsImageChartCardProps extends RunsChartCardReorderProps, RunsChartCardFullScreenProps {
   config: RunsChartsImageCardConfig;
@@ -39,22 +37,38 @@ export const RunsChartsImageChartCard = ({
   ...reorderProps
 }: RunsChartsImageChartCardProps) => {
   const { theme } = useDesignSystemTheme();
-  const containerRef = useRef(null);
-  const [containerWidth, setContainerWidth] = useState(0);
 
   // Optimizations for smoother slider experience. Maintain a local copy of config, and update
   // the global state only after the user has finished dragging the slider.
   const [tmpConfig, setTmpConfig] = useState(config);
+
+  // Keep the local copy in sync when the confirmed config changes (e.g. toggling
+  // "Show run parameters" or image keys from the configuration modal). Without this,
+  // only step updates flow into tmpConfig and other changes require a page refresh.
+  useEffect(() => {
+    setTmpConfig(config);
+  }, [config]);
+
   const confirmChartCardConfiguration = useConfirmChartCardConfigurationFn();
   const updateStep = useCallback(
-    (step: number) => {
-      confirmChartCardConfiguration({ ...config, step } as RunsChartsImageCardConfig);
+    (newStep: number) => {
+      // Skip updating base chart config if step is the same as current step.
+      if (config.step === newStep) {
+        return;
+      }
+      confirmChartCardConfiguration({ ...config, step: newStep } as RunsChartsImageCardConfig);
     },
     [config, confirmChartCardConfiguration],
   );
-  const tmpStepChange = (step: number) => {
-    setTmpConfig((conf) => ({ ...conf, step }));
-  };
+  const tmpStepChange = useCallback((newStep: number) => {
+    setTmpConfig((currentConfig) => {
+      // Skip updating temporary config if step is the same as current step.
+      if (currentConfig.step === newStep) {
+        return currentConfig;
+      }
+      return { ...currentConfig, step: newStep };
+    });
+  }, []);
 
   const chartName = config.imageKeys.length === 1 ? config.imageKeys[0] : DEFAULT_IMAGE_GRID_CHART_NAME;
 
@@ -68,9 +82,12 @@ export const RunsChartsImageChartCard = ({
 
   const slicedRuns = useMemo(() => chartRunData.filter(({ hidden }) => !hidden).reverse(), [chartRunData]);
 
-  const setCardConfig = (setter: (current: RunsChartsCardConfig) => RunsChartsImageCardConfig) => {
-    confirmChartCardConfiguration(setter(config));
-  };
+  const setCardConfig = useCallback(
+    (setter: (current: RunsChartsCardConfig) => RunsChartsImageCardConfig) => {
+      confirmChartCardConfiguration(setter(config));
+    },
+    [config, confirmChartCardConfiguration],
+  );
 
   const { stepMarks, maxMark, minMark } = useImageSliderStepMarks({
     data: slicedRuns,
@@ -83,8 +100,9 @@ export const RunsChartsImageChartCard = ({
     // If there is only one step mark, set the step to the min mark
     if (stepMarkLength === 1 && tmpConfig.step !== minMark) {
       updateStep(minMark);
+      tmpStepChange(minMark);
     }
-  }, [minMark, stepMarkLength, tmpConfig.step, updateStep]);
+  }, [minMark, stepMarkLength, tmpConfig.step, updateStep, tmpStepChange]);
 
   const shouldDisplayImageLimitIndicator =
     slicedRuns.filter((run) => {
@@ -104,7 +122,6 @@ export const RunsChartsImageChartCard = ({
       }}
     >
       <div
-        ref={containerRef}
         css={{
           flex: 1,
           overflow: 'auto',
@@ -160,6 +177,7 @@ export const RunsChartsImageChartCard = ({
       uuid={config.uuid}
       dragGroupKey={RunsChartsChartsDragGroup.GENERAL_AREA}
       toggleFullScreenChart={toggleFullScreenChart}
+      height={IMAGE_CHART_CARD_HEIGHT}
       {...reorderProps}
     >
       {cardBodyToRender}

@@ -2,13 +2,16 @@ import contextlib
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Generator, Optional, Sequence
+from typing import Generator, Sequence
 
 from mlflow.entities import LiveSpan, Trace, TraceData, TraceInfo
 from mlflow.entities.model_registry import PromptVersion
 from mlflow.environment_variables import MLFLOW_TRACE_TIMEOUT_SECONDS
+from mlflow.tracing.constant import TraceTagKey
+from mlflow.tracing.utils.prompt import update_linked_prompts_tag
 from mlflow.tracing.utils.timeout import get_trace_cache_with_timeout
 from mlflow.tracing.utils.truncation import set_request_response_preview
+from mlflow.utils.workspace_context import get_request_workspace
 
 _logger = logging.getLogger(__name__)
 
@@ -20,6 +23,8 @@ class _Trace:
     info: TraceInfo
     span_dict: dict[str, LiveSpan] = field(default_factory=dict)
     prompts: list[PromptVersion] = field(default_factory=list)
+    is_remote_trace: bool = False
+    workspace: str | None = None
 
     def to_mlflow_trace(self) -> Trace:
         trace_data = TraceData()
@@ -30,7 +35,7 @@ class _Trace:
         set_request_response_preview(self.info, trace_data)
         return Trace(self.info, trace_data)
 
-    def get_root_span(self) -> Optional[LiveSpan]:
+    def get_root_span(self) -> LiveSpan | None:
         for span in self.span_dict.values():
             if span.parent_id is None:
                 return span
@@ -45,6 +50,8 @@ class ManagerTrace:
 
     trace: Trace
     prompts: Sequence[PromptVersion]
+    is_remote_trace: bool = False
+    workspace: str | None = None
 
 
 class InMemoryTraceManager:
@@ -52,7 +59,7 @@ class InMemoryTraceManager:
     Manage spans and traces created by the tracing system in memory.
     """
 
-    _instance_lock = threading.Lock()
+    _instance_lock = threading.RLock()
     _instance = None
 
     @classmethod
@@ -69,20 +76,27 @@ class InMemoryTraceManager:
 
         # Store mapping between OpenTelemetry trace ID and MLflow trace ID
         self._otel_id_to_mlflow_trace_id: dict[int, str] = {}
-        self._lock = threading.Lock()  # Lock for _traces
+        self._lock = threading.RLock()  # Lock for _traces
 
-    def register_trace(self, otel_trace_id: int, trace_info: TraceInfo):
+    def register_trace(self, otel_trace_id: int, trace_info: TraceInfo, is_remote_trace=False):
         """
         Register a new trace info object to the in-memory trace registry.
 
         Args:
             otel_trace_id: The OpenTelemetry trace ID for the new trace.
             trace_info: The trace info object to be stored.
+            is_remote_trace: Whether the trace is a remote trace. For a distributed trace, it is
+                registered in both client side and remote server side, for remote server side
+                registration, the 'is_remote_trace' flag is set to True.
         """
         # Check for a new timeout setting whenever a new trace is created.
         self._check_timeout_update()
         with self._lock:
-            self._traces[trace_info.trace_id] = _Trace(trace_info)
+            self._traces[trace_info.trace_id] = _Trace(
+                trace_info,
+                is_remote_trace=is_remote_trace,
+                workspace=get_request_workspace(),
+            )
             self._otel_id_to_mlflow_trace_id[otel_trace_id] = trace_info.trace_id
 
     def register_span(self, span: LiveSpan):
@@ -109,10 +123,20 @@ class InMemoryTraceManager:
             prompt: The prompt version to be registered.
         """
         with self._lock:
-            self._traces[trace_id].prompts.append(prompt)
+            if prompt not in self._traces[trace_id].prompts:
+                self._traces[trace_id].prompts.append(prompt)
+
+            # NB: Set prompt URIs in trace tags for linking.
+            try:
+                current_tag = self._traces[trace_id].info.tags.get(TraceTagKey.LINKED_PROMPTS)
+                updated_tag = update_linked_prompts_tag(current_tag, [prompt])
+                self._traces[trace_id].info.tags[TraceTagKey.LINKED_PROMPTS] = updated_tag
+            except Exception:
+                _logger.debug(f"Failed to update prompts tag for trace {trace_id}", exc_info=True)
+                raise
 
     @contextlib.contextmanager
-    def get_trace(self, trace_id: str) -> Generator[Optional[_Trace], None, None]:
+    def get_trace(self, trace_id: str) -> Generator[_Trace | None, None, None]:
         """
         Yield the trace info for the given trace ID..
         This is designed to be used as a context manager to ensure the trace info is accessed
@@ -121,7 +145,7 @@ class InMemoryTraceManager:
         with self._lock:
             yield self._traces.get(trace_id)
 
-    def get_span_from_id(self, trace_id: str, span_id: str) -> Optional[LiveSpan]:
+    def get_span_from_id(self, trace_id: str, span_id: str) -> LiveSpan | None:
         """
         Get a span object for the given trace_id and span_id.
         """
@@ -130,7 +154,7 @@ class InMemoryTraceManager:
 
         return trace.span_dict.get(span_id) if trace else None
 
-    def get_root_span_id(self, trace_id) -> Optional[str]:
+    def get_root_span_id(self, trace_id) -> str | None:
         """
         Get the root span ID for the given trace ID.
         """
@@ -144,11 +168,21 @@ class InMemoryTraceManager:
 
         return None
 
-    def get_mlflow_trace_id_from_otel_id(self, otel_trace_id: int) -> Optional[str]:
+    def get_mlflow_trace_id_from_otel_id(self, otel_trace_id: int) -> str | None:
         """
         Get the MLflow trace ID for the given OpenTelemetry trace ID.
         """
         return self._otel_id_to_mlflow_trace_id.get(otel_trace_id)
+
+    def has_open_spans(self, otel_trace_id: int) -> bool:
+        """Return True if any span in the trace has not yet ended."""
+        mlflow_trace_id = self.get_mlflow_trace_id_from_otel_id(otel_trace_id)
+        if mlflow_trace_id is None:
+            return False
+        with self.get_trace(mlflow_trace_id) as trace:
+            if trace is None:
+                return False
+            return any(span.end_time_ns is None for span in trace.span_dict.values())
 
     def set_trace_metadata(self, trace_id: str, key: str, value: str):
         """
@@ -158,7 +192,7 @@ class InMemoryTraceManager:
             if trace:
                 trace.info.trace_metadata[key] = value
 
-    def pop_trace(self, otel_trace_id: int) -> Optional[ManagerTrace]:
+    def pop_trace(self, otel_trace_id: int) -> ManagerTrace | None:
         """
         Pop trace data for the given OpenTelemetry trace ID and
         return it as a ManagerTrace wrapper containing the trace and prompts.
@@ -169,7 +203,10 @@ class InMemoryTraceManager:
             if internal_trace is None:
                 return None
             return ManagerTrace(
-                trace=internal_trace.to_mlflow_trace(), prompts=internal_trace.prompts
+                trace=internal_trace.to_mlflow_trace(),
+                prompts=internal_trace.prompts,
+                is_remote_trace=internal_trace.is_remote_trace,
+                workspace=internal_trace.workspace,
             )
 
     def _check_timeout_update(self):

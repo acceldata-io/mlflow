@@ -11,11 +11,10 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections import namedtuple
 from itertools import chain, filterfalse
 from pathlib import Path
 from threading import Timer
-from typing import NamedTuple, Optional
+from typing import NamedTuple
 
 import importlib_metadata
 from packaging.requirements import Requirement
@@ -80,11 +79,11 @@ def _join_continued_lines(lines):
         yield "".join(continued_lines)
 
 
-# Represents a pip requirement.
-#
-# :param req_str: A requirement string (e.g. "scikit-learn == 0.24.2").
-# :param is_constraint: A boolean indicating whether this requirement is a constraint.
-_Requirement = namedtuple("_Requirement", ["req_str", "is_constraint"])
+class _Requirement(NamedTuple):
+    # A string representation of the requirement.
+    req_str: str
+    # A boolean indicating whether this requirement is a constraint.
+    is_constraint: bool
 
 
 def _parse_requirements(requirements, is_constraint, base_dir=None):
@@ -255,21 +254,19 @@ def _run_command(cmd, timeout_seconds, env=None):
         stdout = stdout.decode("utf-8")
         stderr = stderr.decode("utf-8")
         if proc.returncode != 0:
-            msg = "\n".join(
-                [
-                    f"Encountered an unexpected error while running {cmd}",
-                    f"exit status: {proc.returncode}",
-                    f"stdout: {stdout}",
-                    f"stderr: {stderr}",
-                ]
-            )
+            msg = "\n".join([
+                f"Encountered an unexpected error while running {cmd}",
+                f"exit status: {proc.returncode}",
+                f"stdout: {stdout}",
+                f"stderr: {stderr}",
+            ])
             raise MlflowException(msg)
     finally:
         if timer.is_alive():
             timer.cancel()
 
 
-def _get_installed_version(package: str, module: Optional[str] = None) -> str:
+def _get_installed_version(package: str, module: str | None = None) -> str:
     """
     Obtains the installed package version using `importlib_metadata.version`. If it fails, use
     `__import__(module or package).__version__`.
@@ -335,6 +332,12 @@ def _capture_imported_modules(model_uri, flavor, record_full_module=False, extra
         # See: ``https://github.com/mlflow/mlflow/issues/6905`` for context on minio configuration
         # resolution in a subprocess based on PATH entries.
         main_env["PATH"] = "/usr/sbin:/sbin:" + main_env["PATH"]
+        # Clear py4j gateway env vars to prevent the subprocess from connecting to the parent's
+        # py4j gateway. If these are inherited, libraries like databricks-sdk may attempt to use
+        # them, which can corrupt the parent process's py4j connection state and cause errors
+        # like "Error while obtaining a new communication channel" after the subprocess exits.
+        main_env.pop("PYSPARK_GATEWAY_PORT", None)
+        main_env.pop("PYSPARK_GATEWAY_SECRET", None)
         # Add databricks env, for langchain models loading we might need CLI configurations
         if is_in_databricks_runtime():
             main_env.update(get_databricks_env_vars(mlflow.get_tracking_uri()))
@@ -567,15 +570,13 @@ def _get_pinned_requirement(req_str, version=None, module=None):
         module: The name of the top-level module provided by the package . For example,
             if `package` is 'scikit-learn', `module` should be 'sklearn'. If None, defaults
             to `package`.
-        extras: A list of extra names for the package.
 
     """
     req = Requirement(req_str)
     package = req.name
     if version is None:
         version_raw = _get_installed_version(package, module)
-        local_version_label = _get_local_version_label(version_raw)
-        if local_version_label:
+        if local_version_label := _get_local_version_label(version_raw):
             version = _strip_local_version_label(version_raw)
             if not (is_in_databricks_runtime() and package in ("torch", "torchvision")):
                 msg = (
@@ -597,29 +598,32 @@ def _get_pinned_requirement(req_str, version=None, module=None):
 
 class _MismatchedPackageInfo(NamedTuple):
     package_name: str
-    installed_version: Optional[str]
+    installed_version: str | None
     requirement: str
 
     def __str__(self):
-        current_status = self.installed_version if self.installed_version else "uninstalled"
+        current_status = self.installed_version or "uninstalled"
         return f"{self.package_name} (current: {current_status}, required: {self.requirement})"
 
 
-def _check_requirement_satisfied(requirement_str):
+def _check_requirement_satisfied(requirement_str: str) -> _MismatchedPackageInfo | None:
     """
     Checks whether the current python environment satisfies the given requirement if it is parsable
     as a package name and a set of version specifiers, and returns a `_MismatchedPackageInfo`
     object containing the mismatched package name, installed version, and requirement if the
     requirement is not satisfied. Otherwise, returns None.
     """
-    _init_packages_to_modules_map()
     try:
         req = Requirement(requirement_str)
     except Exception:
         # We reach here if the requirement string is a file path or a URL.
         # Extracting the package name from the requirement string is not trivial,
         # so we skip the check.
-        return
+        return None
+    if req.marker and not req.marker.evaluate():
+        return None
+
+    _init_packages_to_modules_map()
     pkg_name = req.name
 
     try:

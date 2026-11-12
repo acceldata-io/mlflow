@@ -28,7 +28,7 @@ this section.
 Before running the script, let's simply start the MLflow UI on a local host.
 
 ```bash
-mlflow ui
+mlflow server
 ```
 
 Let's visit `http://localhost:5000/` in our web browser. After doing so, you'll notice that we don't
@@ -36,7 +36,7 @@ have any experiments or models. Let's resolve this by creating a few MLflow runs
 below.
 
 Note that when you run this script, you'll want to do so from the same directory that you ran
-the `mlflow ui` command.
+the `mlflow server` command.
 
 ```python
 import mlflow
@@ -62,29 +62,23 @@ dataset_context = ["train"] * 5 + ["test"] * 5
 
 for i in range(10):
     with mlflow.start_run():
-        mlflow.log_metrics(
-            {
-                "loss": loss[i],
-                "accuracy": accuracy[i],
-                "log-scale-loss": log_scale_loss[i],
-                "f1 score": f1_score[i],
-            }
-        )
+        mlflow.log_metrics({
+            "loss": loss[i],
+            "accuracy": accuracy[i],
+            "log-scale-loss": log_scale_loss[i],
+            "f1 score": f1_score[i],
+        })
 
-        mlflow.log_params(
-            {
-                "batch_size": batch_size[i],
-                "learning rate": learning_rate[i],
-                "model": model[i],
-            }
-        )
+        mlflow.log_params({
+            "batch_size": batch_size[i],
+            "learning rate": learning_rate[i],
+            "model": model[i],
+        })
 
-        mlflow.set_tags(
-            {
-                "task": task[i],
-                "environment": environment[i],
-            }
-        )
+        mlflow.set_tags({
+            "task": task[i],
+            "environment": environment[i],
+        })
 
         dataset = mlflow.data.from_numpy(
             features=np.random.uniform(size=[20, 28, 28, 3]),
@@ -141,9 +135,7 @@ Second, let's try filtering the runs for our really bad models: `metrics.loss > 
 ```python
 import mlflow
 
-bad_runs = mlflow.search_runs(
-    filter_string="metrics.loss > 0.8", search_all_experiments=True
-)
+bad_runs = mlflow.search_runs(filter_string="metrics.loss > 0.8", search_all_experiments=True)
 print(bad_runs)
 ```
 
@@ -175,22 +167,18 @@ the field is being compared, like `0.8`.
 **Valid Syntax for Left and Right Side Elements:**
 
 1. **Left Side Syntax:**
-
    - Fields without special characters or reserved keywords can be referenced directly (e.g., `tag.test`).
    - Use backticks for fields that contain special characters or are reserved keywords.
    - Double quotes are also acceptable for enclosing field names (e.g., `tag."test"`).
 
    **Unsupported:**
-
    - Single quotes are **not valid** for enclosing field names (e.g., `tag.'test'` results in a syntax error).
 
 2. **Right Side Syntax:**
-
-   - Enclose values in single or double quotes based on content requirements (e.g., `` tag.`test` = 'abc' `` or `` tag.`test` = "abc" ``).
+   - Enclose values in single or double quotes based on content requirements (e.g., ``tag.`test` = 'abc'`` or ``tag.`test` = "abc"``).
    - Non-metric values, **including numeric values** that may be stored as tags or as parameters must be enclosed in quotations.
 
    **Unsupported:**
-
    - Using backticks or no wrapping for values is not allowed. Examples of invalid syntax include:
 
    This results in a syntax error as backticks cannot be used for right-hand values.
@@ -228,7 +216,6 @@ As noted above, MLflow search syntax is similar to SQL with a few notable except
 ```
 
 - For the SQL `IN` keyword, you can only search the following fields:
-
   - `datasets.name`
   - `datasets.digest`
   - `datasets.context`
@@ -241,7 +228,6 @@ a single search condition, you must assemble an inequality using the following c
 
 1. **An MLflow field**: a metric, param, tag, dataset or run metadata.
 2. **A comparator**: an inequality operator.
-
    - For numerics, MLflow supports `=`, `!=`, `>`, `>=`, `<`, and `<=`. Examples include:
 
      ```sql
@@ -256,6 +242,13 @@ a single search condition, you must assemble an inequality using the following c
      params.model = "GPT-4o"
      params.model LIKE "GPT%"
      params.model ILIKE "gpt%"
+     ```
+
+   - For null checks on tags and params, MLflow supports `IS NULL` and `IS NOT NULL`. These check whether a tag or param exists on a run. Examples include:
+
+     ```sql
+     tags.environment IS NOT NULL
+     params.model IS NULL
      ```
 
    - For sets, MLflow supports `IN`. Examples include:
@@ -312,6 +305,8 @@ When querying for numeric parameters, you must specify them as strings by enclos
 params.batch_size = "2"
 params.model LIKE "GPT%"
 params.model ILIKE "gPt%"
+params.model IS NULL
+params.model IS NOT NULL
 params.model LIKE "GPT%" AND params.batch_size = "2"
 ```
 
@@ -331,6 +326,8 @@ tags."environment" = "notebook"
 tags.environment = "notebook"
 tags.task = "Classification"
 tags.task ILIKE "classif%"
+tags.environment IS NOT NULL
+tags.task IS NULL
 ```
 
 #### 4 - Searching By Dataset Information
@@ -414,14 +411,28 @@ You can also apply multiple conditions on the same field, for example searching 
 metrics.loss <= 0.15 AND metrics.loss >= 0.1
 ```
 
-Finally, before moving on it's important to revisit that that you cannot use the `OR` keyword in
+Finally, before moving on it's important to revisit that you cannot use the `OR` keyword in
 your queries.
 
-#### 8 - Non-None Queries
+#### 8 - Null Checks with IS NULL / IS NOT NULL
 
-To search for runs where a field (only type string is supported) is not null, use the
-`field != "None"` syntax. For example, to search for runs where the batch_size is not null, you
-can use the following query:
+To search for runs where a tag or param is present or absent, use `IS NULL` and `IS NOT NULL`.
+`IS NULL` matches runs that do **not** have the specified tag or param, while `IS NOT NULL`
+matches runs that **do** have it.
+
+```sql
+params.model IS NULL
+params.model IS NOT NULL
+tags.environment IS NULL
+tags.environment IS NOT NULL
+tags.task IS NOT NULL AND params.model IS NULL
+```
+
+:::note
+`IS NULL` / `IS NOT NULL` is only supported for **tags** and **params**, not for metrics or attributes.
+:::
+
+You can also check for the string literal `"None"` using the `!=` comparator:
 
 ```sql
 params.batch_size != "None"
@@ -434,7 +445,7 @@ outside the MLflow UI. This can be done programmatically using the MLflow client
 
 ### Python
 
-{""}<APILink fn="mlflow.client.MlflowClient.search_runs" /> or <APILink fn="mlflow.search_runs" /> take
+<APILink fn="mlflow.client.MlflowClient.search_runs" /> or <APILink fn="mlflow.search_runs" /> take
 the same arguments as the above UI examples and more! They return all the runs that match the specified
 filters. Your best resource is the docstrings for each of these functions, but here are some useful examples.
 

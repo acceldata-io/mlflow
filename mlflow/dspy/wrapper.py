@@ -1,7 +1,6 @@
-import importlib.metadata
 import json
 from dataclasses import asdict, is_dataclass
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from packaging.version import Version
 
@@ -14,6 +13,7 @@ from mlflow.protos.databricks_pb2 import (
 )
 from mlflow.pyfunc import PythonModel
 from mlflow.types.schema import DataType, Schema
+from mlflow.utils import get_installed_version
 
 _INVALID_SIZE_MESSAGE = (
     "Dspy model doesn't support batch inference or empty input. Please provide a single input."
@@ -34,14 +34,14 @@ class DspyModelWrapper(PythonModel):
         self,
         model: "dspy.Module",
         dspy_settings: dict[str, Any],
-        model_config: Optional[dict[str, Any]] = None,
+        model_config: dict[str, Any] | None = None,
     ):
         self.model = model
         self.dspy_settings = dspy_settings
         self.model_config = model_config or {}
-        self.output_schema: Optional[Schema] = None
+        self.output_schema: Schema | None = None
 
-    def predict(self, inputs: Any, params: Optional[dict[str, Any]] = None):
+    def predict(self, inputs: Any, params: dict[str, Any] | None = None):
         import dspy
 
         converted_inputs = self._get_model_input(inputs)
@@ -50,9 +50,14 @@ class DspyModelWrapper(PythonModel):
             if isinstance(converted_inputs, dict):
                 # We pass a dict as keyword args and don't allow DSPy models
                 # to receive a single dict.
-                return self.model(**converted_inputs).toDict()
+                result = self.model(**converted_inputs)
             else:
-                return self.model(converted_inputs).toDict()
+                result = self.model(converted_inputs)
+
+            if isinstance(result, dspy.Prediction):
+                return result.toDict()
+            else:
+                return result
 
     def predict_stream(self, inputs: Any, params=None):
         import dspy
@@ -86,7 +91,7 @@ class DspyModelWrapper(PythonModel):
                 else:
                     yield output
 
-    def _get_model_input(self, inputs: Any) -> Union[str, dict[str, Any]]:
+    def _get_model_input(self, inputs: Any) -> str | dict[str, Any]:
         """Convert the PythonModel input into the DSPy program input
 
         Examples of expected conversions:
@@ -132,7 +137,10 @@ class DspyModelWrapper(PythonModel):
     def _validate_streaming(
         self,
     ):
-        if Version(importlib.metadata.version("dspy")) <= Version("2.6.23"):
+        # This is a hard gate: block streaming unless we can confirm dspy >= 2.6.24. An
+        # undeterminable version (None) is not safer than an old one, so refuse it too.
+        dspy_version = get_installed_version("dspy")
+        if dspy_version is None or dspy_version <= Version("2.6.23"):
             raise MlflowException(
                 "Streaming API is only supported in dspy 2.6.24 or later. "
                 "Please upgrade your dspy version."
@@ -141,19 +149,21 @@ class DspyModelWrapper(PythonModel):
         if self.output_schema is None:
             raise MlflowException(
                 "Output schema of the DSPy model is not set. Please log your DSPy "
-                "model with `signature` or `input_example` to use streaming API."
+                "model with `signature` or `input_example` to use streaming API.",
+                error_code=INVALID_PARAMETER_VALUE,
             )
 
         if any(spec.type != DataType.string for spec in self.output_schema):
             raise MlflowException(
-                f"All output fields must be string to use streaming API. Got {self.output_schema}."
+                f"All output fields must be string to use streaming API. Got {self.output_schema}.",
+                error_code=INVALID_PARAMETER_VALUE,
             )
 
 
 class DspyChatModelWrapper(DspyModelWrapper):
     """MLflow PyFunc wrapper class for Dspy chat models."""
 
-    def predict(self, inputs: Any, params: Optional[dict[str, Any]] = None):
+    def predict(self, inputs: Any, params: dict[str, Any] | None = None):
         import dspy
 
         converted_inputs = self._get_model_input(inputs)
@@ -201,7 +211,7 @@ class DspyChatModelWrapper(DspyModelWrapper):
             "Streaming is not supported for DSPy model with task 'llm/v1/chat'."
         )
 
-    def _get_model_input(self, inputs: Any) -> Union[str, list[dict[str, Any]]]:
+    def _get_model_input(self, inputs: Any) -> str | list[dict[str, Any]]:
         import pandas as pd
 
         if isinstance(inputs, dict):

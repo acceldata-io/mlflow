@@ -1,5 +1,7 @@
-import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RunsChartsRunData, RunsChartsLineChartXAxisType, removeOutliersFromMetricHistory } from '../RunsCharts.common';
+import type { ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { RunsChartsRunData } from '../RunsCharts.common';
+import { RunsChartsLineChartXAxisType, removeOutliersFromMetricHistory } from '../RunsCharts.common';
 import { RunsMetricsLinePlot } from '../RunsMetricsLinePlot';
 import { RunsChartsTooltipMode, useRunsChartsTooltip } from '../../hooks/useRunsChartsTooltip';
 import {
@@ -7,12 +9,11 @@ import {
   type RunsChartsCardConfig,
   type RunsChartsLineCardConfig,
 } from '../../runs-charts.types';
+import type { RunsChartCardVisibilityProps, RunsChartCardSizeProps } from './ChartCard.common';
 import {
   type RunsChartCardReorderProps,
   RunsChartCardWrapper,
   RunsChartsChartsDragGroup,
-  RunsChartCardVisibilityProps,
-  RunsChartCardSizeProps,
   RunsChartCardLoadingPlaceholder,
 } from './ChartCard.common';
 import { useSampledMetricHistory } from '../../hooks/useSampledMetricHistory';
@@ -22,38 +23,55 @@ import {
   shouldEnableChartExpressions,
 } from '../../../../../common/utils/FeatureUtils';
 import { findAbsoluteTimestampRangeForRelativeRange } from '../../utils/findChartStepsByTimestamp';
-import { Figure } from 'react-plotly.js';
-import { ReduxState } from '../../../../../redux-types';
+import type { Figure } from 'react-plotly.js';
+import type { ReduxState } from '../../../../../redux-types';
 import { shallowEqual, useSelector } from 'react-redux';
 import { useCompareRunChartSelectedRange } from '../../hooks/useCompareRunChartSelectedRange';
-import { MetricHistoryByName } from '@mlflow/mlflow/src/experiment-tracking/types';
+import type { MetricHistoryByName } from '@mlflow/mlflow/src/experiment-tracking/types';
 import type { RunsGroupByConfig } from '../../../experiment-page/utils/experimentPage.group-row-utils';
 import { useGroupedChartRunData } from '../../../runs-compare/hooks/useGroupedChartRunData';
-import {
-  ExperimentChartImageDownloadFileFormat,
-  useChartImageDownloadHandler,
-} from '../../hooks/useChartImageDownloadHandler';
+import type { ExperimentChartImageDownloadFileFormat } from '../../hooks/useChartImageDownloadHandler';
+import { useChartImageDownloadHandler } from '../../hooks/useChartImageDownloadHandler';
 import { downloadChartMetricHistoryCsv } from '../../../experiment-page/utils/experimentPage.common-utils';
 import { RunsChartsNoDataFoundIndicator } from '../RunsChartsNoDataFoundIndicator';
-import { RunsChartsGlobalLineChartConfig } from '../../../experiment-page/models/ExperimentPageUIState';
+import type { RunsChartsGlobalLineChartConfig } from '../../../experiment-page/models/ExperimentPageUIState';
 import { useLineChartGlobalConfig } from '../hooks/useLineChartGlobalConfig';
+import { useNodeLevelMetricsFilterContext } from '../../../run-page/node-level-metric-charts/contexts/NodeLevelMetricsFilterContext';
+import { createNodeLevelMetricKey } from '../../../run-page/node-level-metric-charts/node-level-metric-charts.utils';
 
-const getV2ChartTitle = (cardConfig: RunsChartsLineCardConfig): string => {
+export const getV2ChartTitle = (cardConfig: RunsChartsLineCardConfig, useMetricDisplayName = true): string => {
+  // For multi-node system metric charts, just use `displayName` as a title if provided
+  if (cardConfig.nodeLevelSystemMetricConfiguration && cardConfig.displayName) {
+    return cardConfig.displayName;
+  }
   if (shouldEnableChartExpressions() && cardConfig.yAxisKey === RunsChartsLineChartYAxisType.EXPRESSION) {
     const expressions = cardConfig.yAxisExpressions?.map((exp) => exp.expression) || [];
     return expressions?.join(' vs ') || '';
   }
   if (!cardConfig.selectedMetricKeys || cardConfig.selectedMetricKeys.length === 0) {
-    return cardConfig.metricKey;
+    return (useMetricDisplayName ? cardConfig.displayName : undefined) ?? cardConfig.metricKey;
+  }
+
+  if (cardConfig.selectedMetricKeys.length === 1) {
+    return (useMetricDisplayName ? cardConfig.displayName : undefined) ?? cardConfig.selectedMetricKeys[0];
   }
 
   return cardConfig.selectedMetricKeys.join(' vs ');
 };
 
+export const getV2ChartTitleTooltip = (cardConfig: RunsChartsLineCardConfig): string => {
+  if (
+    cardConfig.nodeLevelSystemMetricConfiguration ||
+    (shouldEnableChartExpressions() && cardConfig.yAxisKey === RunsChartsLineChartYAxisType.EXPRESSION)
+  ) {
+    return getV2ChartTitle(cardConfig);
+  }
+  const metricKeys = cardConfig.selectedMetricKeys ?? [cardConfig.metricKey];
+  return metricKeys.length <= 1 ? (metricKeys[0] ?? cardConfig.metricKey) : metricKeys.join(' vs ');
+};
+
 export interface RunsChartsLineChartCardProps
-  extends RunsChartCardReorderProps,
-    RunsChartCardSizeProps,
-    RunsChartCardVisibilityProps {
+  extends RunsChartCardReorderProps, RunsChartCardSizeProps, RunsChartCardVisibilityProps {
   config: RunsChartsLineCardConfig;
   chartRunData: RunsChartsRunData[];
 
@@ -71,6 +89,7 @@ export interface RunsChartsLineChartCardProps
   onDownloadFullMetricHistoryCsv?: (runUuids: string[], metricKeys: string[]) => void;
 
   globalLineChartConfig?: RunsChartsGlobalLineChartConfig;
+  useMetricDisplayName?: boolean;
 }
 
 const SUPPORTED_DOWNLOAD_FORMATS: (ExperimentChartImageDownloadFileFormat | 'csv' | 'csv-full')[] = [
@@ -95,6 +114,7 @@ export const RunsChartsLineChartCard = ({
   isInViewport: isInViewportProp,
   isInViewportDeferred: isInViewportDeferredProp,
   positionInSection,
+  useMetricDisplayName = true,
   ...reorderProps
 }: RunsChartsLineChartCardProps) => {
   const { xAxisKey, selectedXAxisMetricKey, lineSmoothness } = useLineChartGlobalConfig(config, globalLineChartConfig);
@@ -102,20 +122,57 @@ export const RunsChartsLineChartCard = ({
   const toggleFullScreenChart = useCallback(() => {
     setFullScreenChart?.({
       config,
-      title: getV2ChartTitle(config),
+      title: getV2ChartTitle(config, useMetricDisplayName),
       subtitle: null,
     });
-  }, [config, setFullScreenChart]);
+  }, [config, setFullScreenChart, useMetricDisplayName]);
 
   const slicedRuns = useMemo(() => chartRunData.filter(({ hidden }) => !hidden).reverse(), [chartRunData]);
 
   const isGrouped = useMemo(() => slicedRuns.some((r) => r.groupParentInfo), [slicedRuns]);
 
-  const isEmptyDataset = useMemo(() => {
+  const filterContext = useNodeLevelMetricsFilterContext();
+  const selectedMetricKeys = useMemo(() => {
     const metricKeys = config.selectedMetricKeys ?? [config.metricKey];
+
+    if (!filterContext || !config.nodeLevelSystemMetricConfiguration) {
+      return metricKeys;
+    }
+
+    const { selectedNodes, selectedGpus } = filterContext;
+    if (selectedNodes.size === 0 && selectedGpus.size === 0) {
+      return metricKeys;
+    }
+
+    return metricKeys.filter((key) => {
+      // Check fully selected nodes (all metrics)
+      for (const nodeId of selectedNodes) {
+        if (key.startsWith(createNodeLevelMetricKey(nodeId, ''))) return true;
+      }
+
+      // Check partially selected nodes (node-level metrics + specific GPUs)
+      for (const [nodeId, gpuSet] of selectedGpus) {
+        const nodePrefix = createNodeLevelMetricKey(nodeId, '');
+        if (!key.startsWith(nodePrefix)) continue;
+
+        // Include node-level metrics (non-GPU-specific)
+        if (!key.includes('/gpu_')) return true;
+
+        // Include specific GPU metrics
+        for (const gpuIndex of gpuSet) {
+          if (key.startsWith(createNodeLevelMetricKey(nodeId, '', gpuIndex))) return true;
+        }
+      }
+
+      return false;
+    });
+  }, [config, filterContext]);
+
+  const isEmptyDataset = useMemo(() => {
+    const metricKeys = selectedMetricKeys;
     const metricsInRuns = slicedRuns.flatMap(({ metrics }) => Object.keys(metrics));
     return intersection(metricKeys, uniq(metricsInRuns)).length === 0;
-  }, [config, slicedRuns]);
+  }, [selectedMetricKeys, slicedRuns]);
 
   const runUuidsToFetch = useMemo(() => {
     if (isGrouped) {
@@ -133,6 +190,9 @@ export const RunsChartsLineChartCard = ({
   }, [slicedRuns, isGrouped]);
 
   const metricKeys = useMemo(() => {
+    if (config.nodeLevelSystemMetricConfiguration) {
+      return selectedMetricKeys;
+    }
     const getYAxisKeys = (config: RunsChartsLineCardConfig) => {
       const fallback = [config.metricKey];
       if (!shouldEnableChartExpressions() || config.yAxisKey !== RunsChartsLineChartYAxisType.EXPRESSION) {
@@ -148,7 +208,7 @@ export const RunsChartsLineChartCard = ({
     const xAxisKeys = !selectedXAxisMetricKey ? [] : [selectedXAxisMetricKey];
 
     return yAxisKeys.concat(xAxisKeys);
-  }, [config, selectedXAxisMetricKey]);
+  }, [config, selectedXAxisMetricKey, selectedMetricKeys]);
 
   const { setTooltip, resetTooltip, destroyTooltip, selectedRunUuid } = useRunsChartsTooltip(
     config,
@@ -197,70 +257,66 @@ export const RunsChartsLineChartCard = ({
   });
 
   const chartLayoutUpdated = ({ layout }: Readonly<Figure>) => {
-    // We only want to update the local state if the chart is not in full screen mode.
-    // If not, this can cause synchronization issues between the full screen and non-full screen charts.
-    if (!fullScreen) {
-      let yAxisMin = yRangeLocal?.[0];
-      let yAxisMax = yRangeLocal?.[1];
-      let xAxisMin = xRangeLocal?.[0];
-      let xAxisMax = xRangeLocal?.[1];
+    let yAxisMin = yRangeLocal?.[0];
+    let yAxisMax = yRangeLocal?.[1];
+    let xAxisMin = xRangeLocal?.[0];
+    let xAxisMax = xRangeLocal?.[1];
 
-      const { autorange: yAxisAutorange, range: newYRange } = layout.yaxis || {};
-      const yRangeChanged = !isEqual(yAxisAutorange ? [undefined, undefined] : newYRange, [yAxisMin, yAxisMax]);
+    const { autorange: yAxisAutorange, range: newYRange } = layout.yaxis || {};
+    const yRangeChanged = !isEqual(yAxisAutorange ? [undefined, undefined] : newYRange, [yAxisMin, yAxisMax]);
 
-      if (yRangeChanged) {
-        // When user zoomed in/out or changed the Y range manually, hide the tooltip
-        destroyTooltip();
+    if (yRangeChanged) {
+      // When user zoomed in/out or changed the Y range manually, hide the tooltip
+      destroyTooltip();
+    }
+
+    if (yAxisAutorange) {
+      yAxisMin = undefined;
+      yAxisMax = undefined;
+    } else if (newYRange) {
+      yAxisMin = newYRange[0];
+      yAxisMax = newYRange[1];
+    }
+
+    const { autorange: xAxisAutorange, range: newXRange } = layout.xaxis || {};
+    if (xAxisAutorange) {
+      // Remove saved range if chart is back to default viewport
+      xAxisMin = undefined;
+      xAxisMax = undefined;
+    } else if (newXRange) {
+      const ungroupedRunUuids = compact(slicedRuns.map(({ runInfo }) => runInfo?.runUuid));
+      const groupedRunUuids = slicedRuns.flatMap(({ groupParentInfo }) => groupParentInfo?.runUuids ?? []);
+
+      if (!shouldEnableRelativeTimeDateAxis() && xAxisKey === RunsChartsLineChartXAxisType.TIME_RELATIVE) {
+        const timestampRange = findAbsoluteTimestampRangeForRelativeRange(
+          resultsByRunUuid,
+          [...ungroupedRunUuids, ...groupedRunUuids],
+          newXRange as [number, number],
+        );
+        setOffsetTimestamp([...(timestampRange as [number, number])]);
+      } else if (xAxisKey === RunsChartsLineChartXAxisType.TIME_RELATIVE_HOURS) {
+        const timestampRange = findAbsoluteTimestampRangeForRelativeRange(
+          resultsByRunUuid,
+          [...ungroupedRunUuids, ...groupedRunUuids],
+          newXRange as [number, number],
+          1000 * 60 * 60, // Convert hours to milliseconds
+        );
+        setOffsetTimestamp([...(timestampRange as [number, number])]);
+      } else {
+        setOffsetTimestamp(undefined);
       }
+      xAxisMin = newXRange[0];
+      xAxisMax = newXRange[1];
+    }
 
-      if (yAxisAutorange) {
-        yAxisMin = undefined;
-        yAxisMax = undefined;
-      } else if (newYRange) {
-        yAxisMin = newYRange[0];
-        yAxisMax = newYRange[1];
-      }
-
-      const { autorange: xAxisAutorange, range: newXRange } = layout.xaxis || {};
-      if (xAxisAutorange) {
-        // Remove saved range if chart is back to default viewport
-        xAxisMin = undefined;
-        xAxisMax = undefined;
-      } else if (newXRange) {
-        const ungroupedRunUuids = compact(slicedRuns.map(({ runInfo }) => runInfo?.runUuid));
-        const groupedRunUuids = slicedRuns.flatMap(({ groupParentInfo }) => groupParentInfo?.runUuids ?? []);
-
-        if (!shouldEnableRelativeTimeDateAxis() && xAxisKey === RunsChartsLineChartXAxisType.TIME_RELATIVE) {
-          const timestampRange = findAbsoluteTimestampRangeForRelativeRange(
-            resultsByRunUuid,
-            [...ungroupedRunUuids, ...groupedRunUuids],
-            newXRange as [number, number],
-          );
-          setOffsetTimestamp([...(timestampRange as [number, number])]);
-        } else if (xAxisKey === RunsChartsLineChartXAxisType.TIME_RELATIVE_HOURS) {
-          const timestampRange = findAbsoluteTimestampRangeForRelativeRange(
-            resultsByRunUuid,
-            [...ungroupedRunUuids, ...groupedRunUuids],
-            newXRange as [number, number],
-            1000 * 60 * 60, // Convert hours to milliseconds
-          );
-          setOffsetTimestamp([...(timestampRange as [number, number])]);
-        } else {
-          setOffsetTimestamp(undefined);
-        }
-        xAxisMin = newXRange[0];
-        xAxisMax = newXRange[1];
-      }
-
-      if (
-        !isEqual(
-          { xMin: xRangeLocal?.[0], xMax: xRangeLocal?.[1], yMin: yRangeLocal?.[0], yMax: yRangeLocal?.[1] },
-          { xMin: xAxisMin, xMax: xAxisMax, yMin: yAxisMin, yMax: yAxisMax },
-        )
-      ) {
-        setXRangeLocal(isUndefined(xAxisMin) || isUndefined(xAxisMax) ? undefined : [xAxisMin, xAxisMax]);
-        setYRangeLocal(isUndefined(yAxisMin) || isUndefined(yAxisMax) ? undefined : [yAxisMin, yAxisMax]);
-      }
+    if (
+      !isEqual(
+        { xMin: xRangeLocal?.[0], xMax: xRangeLocal?.[1], yMin: yRangeLocal?.[0], yMax: yRangeLocal?.[1] },
+        { xMin: xAxisMin, xMax: xAxisMax, yMin: yAxisMin, yMax: yAxisMax },
+      )
+    ) {
+      setXRangeLocal(isUndefined(xAxisMin) || isUndefined(xAxisMax) ? undefined : [xAxisMin, xAxisMax]);
+      setYRangeLocal(isUndefined(yAxisMin) || isUndefined(yAxisMax) ? undefined : [yAxisMin, yAxisMax]);
     }
   };
 
@@ -349,7 +405,7 @@ export const RunsChartsLineChartCard = ({
 
   const onClickDownload = useCallback(
     (format) => {
-      const savedChartTitle = config.selectedMetricKeys?.join('-') ?? config.metricKey;
+      const savedChartTitle = selectedMetricKeys?.join('-') ?? config.metricKey;
       if (format === 'csv-full') {
         const singleRunUuids = compact(chartData.map((d) => d.runInfo?.runUuid));
         const runUuidsFromGroups = compact(
@@ -358,16 +414,16 @@ export const RunsChartsLineChartCard = ({
             .flatMap((group) => group.groupParentInfo?.runUuids),
         );
         const runUuids = [...singleRunUuids, ...runUuidsFromGroups];
-        onDownloadFullMetricHistoryCsv?.(runUuids, config.selectedMetricKeys || [config.metricKey]);
+        onDownloadFullMetricHistoryCsv?.(runUuids, selectedMetricKeys);
         return;
       }
       if (format === 'csv') {
-        downloadChartMetricHistoryCsv(chartData, config.selectedMetricKeys || [config.metricKey], savedChartTitle);
+        downloadChartMetricHistoryCsv(chartData, selectedMetricKeys, savedChartTitle);
         return;
       }
       imageDownloadHandler?.(format, savedChartTitle);
     },
-    [chartData, config, imageDownloadHandler, onDownloadFullMetricHistoryCsv],
+    [chartData, config, imageDownloadHandler, onDownloadFullMetricHistoryCsv, selectedMetricKeys],
   );
 
   // Do not render the card if the chart is empty and the user has enabled hiding empty charts
@@ -383,7 +439,8 @@ export const RunsChartsLineChartCard = ({
     <RunsChartCardWrapper
       onEdit={onEdit}
       onDelete={onDelete}
-      title={getV2ChartTitle(config)}
+      title={getV2ChartTitle(config, useMetricDisplayName)}
+      titleTooltip={getV2ChartTitleTooltip(config)}
       uuid={config.uuid}
       dragGroupKey={RunsChartsChartsDragGroup.GENERAL_AREA}
       supportedDownloadFormats={SUPPORTED_DOWNLOAD_FORMATS}

@@ -4,9 +4,9 @@ import pytest
 from aiohttp import ClientTimeout
 from fastapi.encoders import jsonable_encoder
 
+from mlflow.environment_variables import MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS
 from mlflow.exceptions import MlflowException
-from mlflow.gateway.config import RouteConfig
-from mlflow.gateway.constants import MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS
+from mlflow.gateway.config import EndpointConfig
 from mlflow.gateway.exceptions import AIGatewayException
 from mlflow.gateway.providers.ai21labs import AI21LabsProvider
 from mlflow.gateway.schemas import chat, completions, embeddings
@@ -83,6 +83,13 @@ def completions_response():
     }
 
 
+def test_get_provider_name():
+    config = completions_config()
+    provider = AI21LabsProvider(EndpointConfig(**config))
+    assert provider.DISPLAY_NAME == "AI21Labs"
+    assert provider.get_provider_name() == "ai21"
+
+
 @pytest.mark.asyncio
 async def test_completions():
     resp = completions_response()
@@ -91,7 +98,7 @@ async def test_completions():
         mock.patch("time.time", return_value=1677858242),
         mock.patch("aiohttp.ClientSession.post", return_value=MockAsyncResponse(resp)) as mock_post,
     ):
-        provider = AI21LabsProvider(RouteConfig(**config))
+        provider = AI21LabsProvider(EndpointConfig(**config))
         payload = {
             "prompt": "This is a test",
             "temperature": 0.2,
@@ -117,7 +124,7 @@ async def test_completions():
                 "maxTokens": 1000,
                 "prompt": "This is a test",
             },
-            timeout=ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS),
+            timeout=ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS.get()),
         )
 
 
@@ -125,13 +132,13 @@ async def test_completions():
 async def test_param_invalid_model_name_is_not_permitted():
     config = completions_config_invalid_model()
     with pytest.raises(MlflowException, match=r"An Unsupported AI21Labs model.*"):
-        RouteConfig(**config)
+        EndpointConfig(**config)
 
 
 @pytest.mark.asyncio
 async def test_param_maxTokens_is_not_permitted():
     config = completions_config()
-    provider = AI21LabsProvider(RouteConfig(**config))
+    provider = AI21LabsProvider(EndpointConfig(**config))
     payload = {
         "prompt": "This should fail",
         "maxTokens": 5000,
@@ -145,7 +152,7 @@ async def test_param_maxTokens_is_not_permitted():
 @pytest.mark.asyncio
 async def test_param_model_is_not_permitted():
     config = completions_config()
-    provider = AI21LabsProvider(RouteConfig(**config))
+    provider = AI21LabsProvider(EndpointConfig(**config))
     payload = {
         "prompt": "This should fail",
         "model": "j2-light",
@@ -159,7 +166,7 @@ async def test_param_model_is_not_permitted():
 @pytest.mark.asyncio
 async def test_chat_is_not_supported_for_ai21labs():
     config = chat_config()
-    provider = AI21LabsProvider(RouteConfig(**config))
+    provider = AI21LabsProvider(EndpointConfig(**config))
     payload = {
         "messages": [{"role": "user", "content": "J2-ultra, can you chat with me? I'm lonely."}]
     }
@@ -173,7 +180,7 @@ async def test_chat_is_not_supported_for_ai21labs():
 @pytest.mark.asyncio
 async def test_embeddings_are_not_supported_for_ai21labs():
     config = embedding_config()
-    provider = AI21LabsProvider(RouteConfig(**config))
+    provider = AI21LabsProvider(EndpointConfig(**config))
     payload = {"input": "give me that sweet, sweet vector, please."}
 
     with pytest.raises(AIGatewayException, match=r".*") as e:

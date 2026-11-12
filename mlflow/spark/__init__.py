@@ -18,7 +18,7 @@ import os
 import posixpath
 import re
 import shutil
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 import yaml
@@ -104,16 +104,14 @@ def get_default_pip_requirements(is_spark_connect_model=False):
         reqs.append("pandas<2")
 
     if is_spark_connect_model:
-        reqs.extend(
-            [
-                # Spark connect ML Model uses spark torch distributor to train model
-                _get_pinned_requirement("torch"),
-                # Spark connect ML Model saves feature transformers as sklearn transformer format.
-                _get_pinned_requirement("scikit-learn", module="sklearn"),
-                # Spark connect ML evaluators depend on torcheval package.
-                _get_pinned_requirement("torcheval"),
-            ]
-        )
+        reqs.extend([
+            # Spark connect ML Model uses spark torch distributor to train model
+            _get_pinned_requirement("torch"),
+            # Spark connect ML Model saves feature transformers as sklearn transformer format.
+            _get_pinned_requirement("scikit-learn", module="sklearn"),
+            # Spark connect ML evaluators depend on torcheval package.
+            _get_pinned_requirement("torcheval"),
+        ])
     return reqs
 
 
@@ -149,6 +147,7 @@ def log_model(
     pip_requirements=None,
     extra_pip_requirements=None,
     metadata=None,
+    **kwargs,
 ):
     """
     Log a Spark MLlib model as an MLflow artifact for the current run. This uses the
@@ -245,6 +244,7 @@ def log_model(
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
         metadata: {{ metadata }}
+        kwargs: Extra arguments to pass to the Spark model ``save`` method.
 
     Returns:
         A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
@@ -322,6 +322,7 @@ def log_model(
         is_local_uri(run_root_artifact_uri)
         or databricks_utils.is_in_databricks_serverless_runtime()
         or databricks_utils.is_in_databricks_shared_cluster_runtime()
+        or is_databricks_acled_artifacts_uri(run_root_artifact_uri)
         or not _maybe_save_model(
             spark_model,
             append_to_uri_path(run_root_artifact_uri, artifact_path),
@@ -714,6 +715,7 @@ def save_model(
     pip_requirements=None,
     extra_pip_requirements=None,
     metadata=None,
+    **kwargs,
 ):
     """
     Save a Spark MLlib Model to a local path.
@@ -739,6 +741,7 @@ def save_model(
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
         metadata: {{ metadata }}
+        kwargs: {{ kwargs }}
 
     .. code-block:: python
         :caption: Example
@@ -919,7 +922,7 @@ def load_model(model_uri, dfs_tmpdir=None, dst_path=None):
     .. code-block:: python
         :caption: Example
 
-        from mlflow import spark
+        import mlflow
 
         model = mlflow.spark.load_model("spark-model")
         # Prepare test documents, which are unlabeled (id, text) tuples.
@@ -945,12 +948,12 @@ def load_model(model_uri, dfs_tmpdir=None, dst_path=None):
         spark_model_local_path = os.path.join(local_mlflow_model_path, flavor_conf["model_data"])
         return _load_spark_connect_model(model_class, spark_model_local_path)
 
-    if _should_use_mlflowdbfs(model_uri):
+    if _should_use_mlflowdbfs(model_uri) and (
+        run_id := DatabricksArtifactRepository._extract_run_id(model_uri)
+    ):
         from pyspark.ml.pipeline import PipelineModel
 
-        mlflowdbfs_path = _mlflowdbfs_path(
-            DatabricksArtifactRepository._extract_run_id(model_uri), artifact_path
-        )
+        mlflowdbfs_path = _mlflowdbfs_path(run_id, artifact_path)
         with databricks_utils.MlflowCredentialContext(
             get_databricks_profile_uri_from_artifact_uri(root_uri)
         ):
@@ -1078,7 +1081,7 @@ class _PyFuncModelWrapper:
     def predict(
         self,
         pandas_df,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ):
         """
         Generate predictions given input data in a pandas DataFrame.
@@ -1191,7 +1194,8 @@ def autolog(disable=False, silent=False):
         # ensure the org.mlflow:mlflow-spark_2.12:2.16.2 is attached as a library to
         # your cluster
         spark = (
-            SparkSession.builder.config(
+            SparkSession.builder
+            .config(
                 "spark.jars.packages",
                 "org.mlflow:mlflow-spark_2.12:2.16.2",
             )

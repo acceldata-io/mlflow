@@ -1,7 +1,5 @@
-"""
-This file contains unit tests for the legacy Gemini Python SDK
-https://github.com/google-gemini/generative-ai-python
-"""
+# Tests for the legacy Gemini Python SDK:
+# https://github.com/google-gemini/generative-ai-python
 
 import base64
 from unittest.mock import patch
@@ -62,11 +60,6 @@ _DUMMY_GENERATE_CONTENT_RESPONSE = genai.types.GenerateContentResponse.from_resp
 _DUMMY_COUNT_TOKENS_RESPONSE = {"total_count": 10}
 
 _DUMMY_EMBEDDING_RESPONSE = {"embedding": [1, 2, 3]}
-
-_CHAT_MESSAGES = [
-    {"role": "user", "content": "test content"},
-    {"role": "assistant", "content": [{"type": "text", "text": "test answer"}]},
-]
 
 
 def generate_content(self, contents):
@@ -129,7 +122,6 @@ def test_generate_content_enable_disable_autolog():
         assert span.span_type == SpanType.LLM
         assert span.inputs == {"contents": "test content"}
         assert span.outputs == _GENERATE_CONTENT_RESPONSE
-        assert span.get_attribute("mlflow.chat.messages") == _CHAT_MESSAGES
 
         mlflow.gemini.autolog(disable=True)
         model = genai.GenerativeModel("gemini-1.5-flash")
@@ -174,19 +166,6 @@ def test_generate_content_image_autolog():
     assert span.span_type == SpanType.LLM
     assert span.inputs == {"contents": request}
     assert span.outputs == _GENERATE_CONTENT_RESPONSE
-    assert span.get_attribute("mlflow.chat.messages") == [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"detail": "auto", "url": f"data:image/jpeg;base64,{image}"},
-                },
-                {"type": "text", "text": "Caption this image"},
-            ],
-        },
-        {"role": "assistant", "content": [{"type": "text", "text": "test answer"}]},
-    ]
 
 
 def test_generate_content_tool_calling_autolog():
@@ -210,24 +189,6 @@ def test_generate_content_tool_calling_autolog():
         genai.protos.GenerateContentResponse(raw_response)
     )
 
-    chat_messages = [
-        {
-            "content": "I have 57 cats, each owns 44 mittens, how many mittens is that in total?",
-            "role": "user",
-        },
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "multiply",
-                    "type": "function",
-                    "function": {"name": "multiply", "arguments": '{"a": 57.0, "b": 44.0}'},
-                }
-            ],
-        },
-    ]
-
     def generate_content(self, content):
         return response
 
@@ -249,100 +210,52 @@ def test_generate_content_tool_calling_autolog():
         "content": "I have 57 cats, each owns 44 mittens, how many mittens is that in total?"
     }
     assert span.get_attribute("mlflow.chat.tools") == TOOL_ATTRIBUTE
-    assert span.get_attribute("mlflow.chat.messages") == chat_messages
 
 
 def test_generate_content_tool_calling_chat_history_autolog():
-    question_content = genai.protos.Content(
-        {
-            "parts": [
-                {
-                    "text": "I have 57 cats, each owns 44 mittens, how many mittens in total?",
-                }
-            ],
-            "role": "user",
-        }
-    )
+    question_content = genai.protos.Content({
+        "parts": [
+            {
+                "text": "I have 57 cats, each owns 44 mittens, how many mittens in total?",
+            }
+        ],
+        "role": "user",
+    })
 
-    tool_call_content = genai.protos.Content(
-        {
+    tool_call_content = genai.protos.Content({
+        "parts": [
+            {
+                "function_call": {
+                    "name": "multiply",
+                    "args": {
+                        "a": 57.0,
+                        "b": 44.0,
+                    },
+                }
+            }
+        ],
+        "role": "model",
+    })
+
+    tool_response_content = genai.protos.Content({
+        "parts": [{"function_response": {"name": "multiply", "response": {"result": 2508.0}}}],
+        "role": "user",
+    })
+
+    raw_response = _generate_content_response(
+        genai.protos.Content({
             "parts": [
                 {
-                    "function_call": {
-                        "name": "multiply",
-                        "args": {
-                            "a": 57.0,
-                            "b": 44.0,
-                        },
-                    }
+                    "text": "57 cats * 44 mittens/cat = 2508 mittens in total.",
                 }
             ],
             "role": "model",
-        }
-    )
-
-    tool_response_content = genai.protos.Content(
-        {
-            "parts": [{"function_response": {"name": "multiply", "response": {"result": 2508.0}}}],
-            "role": "user",
-        }
-    )
-
-    raw_response = _generate_content_response(
-        genai.protos.Content(
-            {
-                "parts": [
-                    {
-                        "text": "57 cats * 44 mittens/cat = 2508 mittens in total.",
-                    }
-                ],
-                "role": "model",
-            }
-        )
+        })
     )
 
     response = genai.types.GenerateContentResponse.from_response(
         genai.protos.GenerateContentResponse(raw_response)
     )
-
-    # Gemini added "id" field in the tool response from version 0.8.3
-    if Version(genai.__version__) <= Version("0.8.3"):
-        tool_result = "{'name': 'multiply', 'response': {'result': 2508.0}}"
-    else:
-        tool_result = "{'name': 'multiply', 'response': {'result': 2508.0}, 'id': ''}"
-
-    chat_messages = [
-        {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "I have 57 cats, each owns 44 mittens, how many mittens in total?",
-                },
-            ],
-            "role": "user",
-        },
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "multiply",
-                    "type": "function",
-                    "function": {"name": "multiply", "arguments": '{"a": 57.0, "b": 44.0}'},
-                }
-            ],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": tool_result}],
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "57 cats * 44 mittens/cat = 2508 mittens in total."}
-            ],
-        },
-    ]
 
     def generate_content(self, content):
         return response
@@ -363,7 +276,6 @@ def test_generate_content_tool_calling_chat_history_autolog():
         "content": [str(question_content), str(tool_call_content), str(tool_response_content)]
     }
     assert span.get_attribute("mlflow.chat.tools") == TOOL_ATTRIBUTE
-    assert span.get_attribute("mlflow.chat.messages") == chat_messages
 
 
 def test_chat_session_autolog():
@@ -382,7 +294,6 @@ def test_chat_session_autolog():
         assert span.span_type == SpanType.CHAT_MODEL
         assert span.inputs == {"content": "test content"}
         assert span.outputs == _GENERATE_CONTENT_RESPONSE
-        assert span.get_attribute("mlflow.chat.messages") == _CHAT_MESSAGES
 
         mlflow.gemini.autolog(disable=True)
         model = genai.GenerativeModel("gemini-1.5-flash")

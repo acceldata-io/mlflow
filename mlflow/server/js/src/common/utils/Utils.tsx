@@ -9,13 +9,17 @@ import React from 'react';
 import moment from 'moment';
 import qs from 'qs';
 import { MLFLOW_INTERNAL_PREFIX } from './TagUtils';
-import _ from 'lodash';
+import { flatMap as lodashFlatMap, merge, omit, sortBy, spread, uniq, uniqWith, groupBy } from 'lodash';
 import { ErrorCodes, SupportPageUrl } from '../constants';
-import { FormattedMessage, IntlShape } from 'react-intl';
+import type { IntlShape } from 'react-intl';
+import { FormattedMessage } from 'react-intl';
 import { ErrorWrapper } from './ErrorWrapper';
-import { KeyValueEntity, RunInfoEntity } from '../../experiment-tracking/types';
+import { NetworkRequestError } from '@databricks/web-shared/errors';
+import type { RunInfoEntity } from '../../experiment-tracking/types';
+import type { KeyValueEntity } from '../types';
 import { NOTE_CONTENT_TAG } from '../../experiment-tracking/utils/NoteUtils';
 
+// eslint-disable-next-line @typescript-eslint/no-extraneous-class -- TODO(FEINF-4274)
 class Utils {
   /**
    * Merge a runs parameters / metrics.
@@ -64,13 +68,15 @@ class Utils {
   }
 
   /**
-   * Displays the info notification in the UI.
+   * Displays the info notification in the UI. `style` is forwarded to the
+   * underlying notification (e.g. to widen it past the default fixed width so
+   * single-line content doesn't wrap).
    */
-  static displayGlobalInfoNotification(content: any, duration?: any) {
+  static displayGlobalInfoNotification(content: any, duration?: any, style?: any) {
     if (!Utils.#notificationsApi) {
       return;
     }
-    (Utils.#notificationsApi as any).info({ message: content, duration: duration });
+    (Utils.#notificationsApi as any).info({ message: content, duration: duration, style: style });
   }
 
   static runNameTag = 'mlflow.runName';
@@ -400,7 +406,7 @@ class Utils {
     const urlSearchParams = new URLSearchParams(currentQueryParams);
     Object.entries(newQueryParams).forEach(
       // @ts-expect-error TS(2345): Argument of type 'unknown' is not assignable to pa... Remove this comment to see the full error message
-      ([key, value]) => !!key && !!value && urlSearchParams.set(key, value),
+      ([key, value]) => Boolean(key) && Boolean(value) && urlSearchParams.set(key, value),
     );
     const queryParams = urlSearchParams.toString();
     if (queryParams !== '' && !queryParams.includes('?')) {
@@ -491,7 +497,7 @@ class Utils {
     revisionId: any,
     runUuid: any,
     sourceName: any,
-    workspaceUrl = null,
+    workspaceUrl: string | null = null,
     nameOverride: string | null = null,
   ) {
     // sourceName may not be present when rendering feature table notebook consumers from remote
@@ -504,20 +510,28 @@ class Utils {
 
     if (notebookId) {
       const url = Utils.getNotebookSourceUrl(queryParams, notebookId, revisionId, runUuid, workspaceUrl);
+      if (!url) {
+        return name;
+      }
       return (
         <a title={sourceName || Utils.getDefaultNotebookRevisionName(notebookId, revisionId)} href={url} target="_top">
           {name}
         </a>
       );
-    } else {
-      return name;
     }
+    return name;
   }
 
   /**
    * Returns the URL for the notebook source.
    */
-  static getNotebookSourceUrl(queryParams: any, notebookId: any, revisionId: any, runUuid: any, workspaceUrl = null) {
+  static getNotebookSourceUrl(
+    queryParams: any,
+    notebookId: any,
+    revisionId: any,
+    runUuid: any,
+    workspaceUrl: string | null = null,
+  ) {
     let url = Utils.setQueryParams(workspaceUrl || window.location.origin, queryParams);
     url += `#notebook/${notebookId}`;
     if (revisionId) {
@@ -526,7 +540,7 @@ class Utils {
         url += `/mlflow/run/${runUuid}`;
       }
     }
-    return url;
+    return Utils.isValidHttpUrl(url) ? url : '';
   }
 
   /**
@@ -537,7 +551,7 @@ class Utils {
     jobId: any,
     jobRunId: any,
     jobName: any,
-    workspaceUrl = null,
+    workspaceUrl: string | null = null,
     nameOverride: string | null = null,
   ) {
     // jobName may not be present when rendering feature table job consumers from remote
@@ -548,26 +562,28 @@ class Utils {
 
     if (jobId) {
       const url = Utils.getJobSourceUrl(queryParams, jobId, jobRunId, workspaceUrl);
+      if (!url) {
+        return name;
+      }
       return (
         <a title={reformatJobName} href={url} target="_top">
           {name}
         </a>
       );
-    } else {
-      return name;
     }
+    return name;
   }
 
   /**
    * Returns the URL for the job source.
    */
-  static getJobSourceUrl(queryParams: any, jobId: any, jobRunId: any, workspaceUrl = null) {
+  static getJobSourceUrl(queryParams: any, jobId: any, jobRunId: any, workspaceUrl: string | null = null) {
     let url = Utils.setQueryParams(workspaceUrl || window.location.origin, queryParams);
     url += `#job/${jobId}`;
     if (jobRunId) {
       url += `/run/${jobRunId}`;
     }
-    return url;
+    return Utils.isValidHttpUrl(url) ? url : '';
   }
 
   /**
@@ -876,7 +892,7 @@ class Utils {
   }
 
   static getVisibleTagKeyList(tagsList: any) {
-    return _.uniq(_.flatMap(tagsList, (tags) => Utils.getVisibleTagValues(tags).map(([key]) => key)));
+    return uniq(lodashFlatMap(tagsList, (tags) => Utils.getVisibleTagValues(tags).map(([key]) => key)));
   }
 
   /**
@@ -888,13 +904,11 @@ class Utils {
    * From https://stackoverflow.com/a/38506572/13837474
    */
   static concatAndGroupArraysById(array: any, arrayToConcat: any, id: any) {
+    const groupedArrays = groupBy(array.concat(arrayToConcat), id);
     return (
-      _(array)
-        .concat(arrayToConcat)
-        .groupBy(id)
+      Object.values(groupedArrays)
         // complication of _.merge necessary to avoid mutating arguments
-        .map(_.spread((obj, source) => _.merge({}, obj, source)))
-        .value()
+        .map(spread((obj, source) => merge({}, obj, source)))
     );
   }
 
@@ -926,7 +940,7 @@ class Utils {
         // extract artifact path, flavors and creation time from tag.
         // 'python_function' should be interpreted as pyfunc flavor
         const filtered = models.map((model: any) => {
-          const removeFunc = Object.keys(_.omit(model.flavors, 'python_function'));
+          const removeFunc = Object.keys(omit(model.flavors, 'python_function'));
           const flavors = removeFunc.length ? removeFunc : ['pyfunc'];
           return {
             artifactPath: model.artifact_path,
@@ -936,7 +950,7 @@ class Utils {
         });
         // sort in descending order of creation time
         const sorted = filtered.sort((a: any, b: any) => parseFloat(b.utcTimeCreated) - parseFloat(a.utcTimeCreated));
-        return _.uniqWith(sorted, (a, b) => (a as any).artifactPath === (b as any).artifactPath);
+        return uniqWith(sorted, (a, b) => (a as any).artifactPath === (b as any).artifactPath);
       }
     }
     return [];
@@ -970,30 +984,19 @@ class Utils {
       'artifactPath',
     );
     return models.sort((a, b) => {
-      // @ts-expect-error TODO: fix this
       if (a.registeredModelVersion && b.registeredModelVersion) {
-        // @ts-expect-error TODO: fix this
         if (a.flavors && !b.flavors) {
           return -1;
-          // @ts-expect-error TODO: fix this
         } else if (!a.flavors && b.flavors) {
           return 1;
         } else {
-          return (
-            // @ts-expect-error TODO: fix this
-            parseInt(b.registeredModelCreationTimestamp, 10) -
-            // @ts-expect-error TODO: fix this
-            parseInt(a.registeredModelCreationTimestamp, 10)
-          );
+          return parseInt(b.registeredModelCreationTimestamp, 10) - parseInt(a.registeredModelCreationTimestamp, 10);
         }
-        // @ts-expect-error TODO: fix this
       } else if (a.registeredModelVersion && !b.registeredModelVersion) {
         return -1;
-        // @ts-expect-error TODO: fix this
       } else if (!a.registeredModelVersion && b.registeredModelVersion) {
         return 1;
       }
-      // @ts-expect-error TODO: fix this
       return b.utcTimeCreated - a.utcTimeCreated;
     });
   }
@@ -1005,13 +1008,13 @@ class Utils {
     duration = 3,
     passErrorToParentFrame = false,
   ) {
-    // eslint-disable-next-line no-console -- TODO(FEINF-3587)
-    console.error(e);
     if (typeof e === 'string') {
       Utils.displayGlobalErrorNotification(e, duration);
     } else if (e instanceof ErrorWrapper) {
       // not all error is wrapped by ErrorWrapper
       Utils.displayGlobalErrorNotification(e.renderHttpError(), duration);
+    } else if (e instanceof NetworkRequestError) {
+      Utils.displayGlobalErrorNotification(e.displayMessage, duration);
       // eslint-disable-next-line no-empty
     } else {
     }
@@ -1042,7 +1045,7 @@ class Utils {
   }
 
   static sortExperimentsById = (experiments: any) => {
-    return _.sortBy(experiments, [({ experimentId }) => experimentId]);
+    return sortBy(experiments, [({ experimentId }) => experimentId]);
   };
 
   static getExperimentNameMap = (experiments: any) => {

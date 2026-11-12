@@ -1,3 +1,4 @@
+import os
 from unittest import mock
 
 import pytest
@@ -5,37 +6,19 @@ import pytest
 import mlflow
 from mlflow.entities.assessment import (
     AssessmentError,
-    AssessmentSource,
     Expectation,
-    ExpectationValue,
     Feedback,
-    FeedbackValue,
+    IssueReference,
 )
 from mlflow.entities.assessment_source import AssessmentSource, AssessmentSourceType
-from mlflow.entities.trace_data import TraceData
-from mlflow.entities.trace_info_v2 import TraceInfoV2
-from mlflow.entities.trace_status import TraceStatus
+from mlflow.entities.issue import IssueStatus
 from mlflow.exceptions import MlflowException
-
-
-# TODO: This test mocks out the tracking client and only test if the fluent API implementation
-# passes the correct arguments to the low-level client. Once the OSS backend is implemented,
-# we should also test the end-to-end assessment CRUD functionality.
-@pytest.fixture
-def store():
-    mock_store = mock.MagicMock()
-    with mock.patch("mlflow.tracing.client._get_store", return_value=mock_store):
-        yield mock_store
-
-
-# TODO: Remove this once the OSS backend is implemented
-@pytest.fixture
-def tracking_uri():
-    original_tracking_uri = mlflow.get_tracking_uri()
-    mlflow.set_tracking_uri("databricks")
-    yield
-    mlflow.set_tracking_uri(original_tracking_uri)
-
+from mlflow.tracing.distributed import (
+    get_tracing_context_headers_for_http_request,
+    set_tracing_context_from_http_request_headers,
+)
+from mlflow.tracing.trace_manager import InMemoryTraceManager
+from mlflow.version import IS_TRACING_SDK_ONLY
 
 _HUMAN_ASSESSMENT_SOURCE = AssessmentSource(
     source_type=AssessmentSourceType.HUMAN,
@@ -47,12 +30,56 @@ _LLM_ASSESSMENT_SOURCE = AssessmentSource(
     source_id="gpt-4o-mini",
 )
 
+_CODE_ASSESSMENT_SOURCE = AssessmentSource(
+    source_type=AssessmentSourceType.CODE,
+    source_id="issue_detector.py",
+)
+
+
+@pytest.fixture
+def trace_id():
+    with mlflow.start_span(name="test_span") as span:
+        pass
+
+    mlflow.flush_trace_async_logging()
+    return span.trace_id
+
+
+@pytest.fixture(params=["file", "sqlalchemy"], autouse=True)
+def tracking_uri(request, tmp_path, db_uri):
+    """Set an MLflow Tracking URI with different type of backend."""
+    if request.param == "file":
+        pytest.skip("FileStore is no longer supported.")
+    if "MLFLOW_SKINNY" in os.environ and request.param == "sqlalchemy":
+        pytest.skip("SQLAlchemy store is not available in skinny.")
+
+    if IS_TRACING_SDK_ONLY and request.param == "sqlalchemy":
+        pytest.skip("SQLAlchemy store is not available in tracing SDK only mode.")
+
+    original_tracking_uri = mlflow.get_tracking_uri()
+
+    if request.param == "file":
+        tracking_uri = tmp_path.joinpath("file").as_uri()
+    elif request.param == "sqlalchemy":
+        tracking_uri = db_uri
+
+    # NB: MLflow tracer does not handle the change of tracking URI well,
+    # so we need to reset the tracer to switch the tracking URI during testing.
+    mlflow.tracing.disable()
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.tracing.enable()
+
+    yield tracking_uri
+
+    # Reset tracking URI
+    mlflow.set_tracking_uri(original_tracking_uri)
+
 
 @pytest.mark.parametrize("legacy_api", [True, False])
-def test_log_expectation(store, tracking_uri, legacy_api):
+def test_log_expectation(trace_id, legacy_api):
     if legacy_api:
         mlflow.log_expectation(
-            trace_id="1234",
+            trace_id=trace_id,
             name="expected_answer",
             value="MLflow",
             source=_HUMAN_ASSESSMENT_SOURCE,
@@ -65,23 +92,26 @@ def test_log_expectation(store, tracking_uri, legacy_api):
             source=_HUMAN_ASSESSMENT_SOURCE,
             metadata={"key": "value"},
         )
-        mlflow.log_assessment(trace_id="1234", assessment=feedback)
+        mlflow.log_assessment(trace_id=trace_id, assessment=feedback)
 
-    assert store.create_assessment.call_count == 1
-    assessment = store.create_assessment.call_args[0][0]
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert isinstance(assessment, Expectation)
+    assert assessment.trace_id == trace_id
     assert assessment.name == "expected_answer"
-    assert assessment.trace_id == "1234"
+    assert assessment.value == "MLflow"
+    assert assessment.trace_id == trace_id
     assert assessment.span_id is None
     assert assessment.source == _HUMAN_ASSESSMENT_SOURCE
     assert assessment.create_time_ms is not None
     assert assessment.last_update_time_ms is not None
     assert assessment.expectation.value == "MLflow"
-    assert assessment.feedback is None
     assert assessment.rationale is None
     assert assessment.metadata == {"key": "value"}
 
 
-def test_log_expectation_invalid_parameters(tracking_uri):
+def test_log_expectation_invalid_parameters():
     with pytest.raises(MlflowException, match=r"The `value` field must be specified."):
         Expectation(
             name="expected_answer",
@@ -90,30 +120,41 @@ def test_log_expectation_invalid_parameters(tracking_uri):
         )
 
 
-def test_update_expectation(store, tracking_uri):
-    assessment = Expectation(name="expected_answer", value="MLflow")
-    mlflow.update_assessment(
-        assessment_id="1234",
-        trace_id="tr-1234",
-        assessment=assessment,
+def test_update_expectation(trace_id):
+    assessment_id = mlflow.log_expectation(
+        trace_id=trace_id,
+        name="expected_answer",
+        value="MLflow",
+    ).assessment_id
+
+    updated_assessment = Expectation(
+        name="expected_answer",
+        value="Spark",
+        metadata={"reason": "human override"},
     )
 
-    assert store.update_assessment.call_count == 1
-    call_args = store.update_assessment.call_args[1]
-    assert call_args["trace_id"] == "tr-1234"
-    assert call_args["assessment_id"] == "1234"
-    assert call_args["name"] == "expected_answer"
-    assert call_args["expectation"] == ExpectationValue(value="MLflow")
-    assert call_args["feedback"] is None
-    assert call_args["rationale"] is None
-    assert call_args["metadata"] is None
+    mlflow.update_assessment(
+        assessment_id=assessment_id,
+        trace_id=trace_id,
+        assessment=updated_assessment,
+    )
+
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert assessment.trace_id == trace_id
+    assert assessment.name == "expected_answer"
+    assert assessment.expectation.value == "Spark"
+    assert assessment.feedback is None
+    assert assessment.rationale is None
+    assert assessment.metadata == {"reason": "human override"}
 
 
 @pytest.mark.parametrize("legacy_api", [True, False])
-def test_log_feedback(store, tracking_uri, legacy_api):
+def test_log_feedback(trace_id, legacy_api):
     if legacy_api:
         mlflow.log_feedback(
-            trace_id="1234",
+            trace_id=trace_id,
             name="faithfulness",
             value=1.0,
             source=_LLM_ASSESSMENT_SOURCE,
@@ -128,12 +169,14 @@ def test_log_feedback(store, tracking_uri, legacy_api):
             rationale="This answer is very faithful.",
             metadata={"model": "gpt-4o-mini"},
         )
-        mlflow.log_assessment(trace_id="1234", assessment=feedback)
+        mlflow.log_assessment(trace_id=trace_id, assessment=feedback)
 
-    assert store.create_assessment.call_count == 1
-    assessment = store.create_assessment.call_args[0][0]
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert isinstance(assessment, Feedback)
+    assert assessment.trace_id == trace_id
     assert assessment.name == "faithfulness"
-    assert assessment.trace_id == "1234"
     assert assessment.span_id is None
     assert assessment.source == _LLM_ASSESSMENT_SOURCE
     assert assessment.create_time_ms is not None
@@ -146,10 +189,10 @@ def test_log_feedback(store, tracking_uri, legacy_api):
 
 
 @pytest.mark.parametrize("legacy_api", [True, False])
-def test_log_feedback_with_error(store, tracking_uri, legacy_api):
+def test_log_feedback_with_error(trace_id, legacy_api):
     if legacy_api:
         mlflow.log_feedback(
-            trace_id="1234",
+            trace_id=trace_id,
             name="faithfulness",
             source=_LLM_ASSESSMENT_SOURCE,
             error=AssessmentError(
@@ -167,12 +210,13 @@ def test_log_feedback_with_error(store, tracking_uri, legacy_api):
                 error_message="Rate limit for the judge exceeded.",
             ),
         )
-        mlflow.log_assessment(trace_id="1234", assessment=feedback)
+        mlflow.log_assessment(trace_id=trace_id, assessment=feedback)
 
-    assert store.create_assessment.call_count == 1
-    assessment = store.create_assessment.call_args[0][0]
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
     assert assessment.name == "faithfulness"
-    assert assessment.trace_id == "1234"
+    assert assessment.trace_id == trace_id
     assert assessment.span_id is None
     assert assessment.source == _LLM_ASSESSMENT_SOURCE
     assert assessment.create_time_ms is not None
@@ -185,13 +229,12 @@ def test_log_feedback_with_error(store, tracking_uri, legacy_api):
 
 
 @pytest.mark.parametrize("legacy_api", [True, False])
-def test_log_feedback_with_exception_object(store, tracking_uri, legacy_api):
-    """Test that log_feedback correctly accepts Exception objects."""
+def test_log_feedback_with_exception_object(trace_id, legacy_api):
     test_exception = ValueError("Test exception message")
 
     if legacy_api:
         mlflow.log_feedback(
-            trace_id="1234",
+            trace_id=trace_id,
             name="faithfulness",
             source=_LLM_ASSESSMENT_SOURCE,
             error=test_exception,
@@ -203,12 +246,13 @@ def test_log_feedback_with_exception_object(store, tracking_uri, legacy_api):
             source=_LLM_ASSESSMENT_SOURCE,
             error=test_exception,
         )
-        mlflow.log_assessment(trace_id="1234", assessment=feedback)
+        mlflow.log_assessment(trace_id=trace_id, assessment=feedback)
 
-    assert store.create_assessment.call_count == 1
-    assessment = store.create_assessment.call_args[0][0]
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
     assert assessment.name == "faithfulness"
-    assert assessment.trace_id == "1234"
+    assert assessment.trace_id == trace_id
     assert assessment.span_id is None
     assert assessment.source == _LLM_ASSESSMENT_SOURCE
     assert assessment.create_time_ms is not None
@@ -223,10 +267,10 @@ def test_log_feedback_with_exception_object(store, tracking_uri, legacy_api):
 
 
 @pytest.mark.parametrize("legacy_api", [True, False])
-def test_log_feedback_with_value_and_error(store, tracking_uri, legacy_api):
+def test_log_feedback_with_value_and_error(trace_id, legacy_api):
     if legacy_api:
         mlflow.log_feedback(
-            trace_id="1234",
+            trace_id=trace_id,
             name="faithfulness",
             source=_LLM_ASSESSMENT_SOURCE,
             value=0.5,
@@ -245,12 +289,13 @@ def test_log_feedback_with_value_and_error(store, tracking_uri, legacy_api):
                 error_message="Rate limit for the judge exceeded.",
             ),
         )
-        mlflow.log_assessment(trace_id="1234", assessment=feedback)
+        mlflow.log_assessment(trace_id=trace_id, assessment=feedback)
 
-    assert store.create_assessment.call_count == 1
-    assessment = store.create_assessment.call_args[0][0]
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
     assert assessment.name == "faithfulness"
-    assert assessment.trace_id == "1234"
+    assert assessment.trace_id == trace_id
     assert assessment.span_id is None
     assert assessment.source == _LLM_ASSESSMENT_SOURCE
     assert assessment.create_time_ms is not None
@@ -262,14 +307,25 @@ def test_log_feedback_with_value_and_error(store, tracking_uri, legacy_api):
     assert assessment.rationale is None
 
 
-def test_log_feedback_invalid_parameters(tracking_uri):
-    with pytest.raises(MlflowException, match=r"Either `value` or `error` must be provided."):
-        Feedback(
-            trace_id="1234",
-            name="faithfulness",
-            source=_LLM_ASSESSMENT_SOURCE,
-        )
+def test_log_feedback_none_value(trace_id):
+    mlflow.log_feedback(
+        trace_id=trace_id,
+        name="faithfulness",
+        value=None,
+        source=_LLM_ASSESSMENT_SOURCE,
+    )
 
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert isinstance(assessment, Feedback)
+    assert assessment.trace_id == trace_id
+    assert assessment.name == "faithfulness"
+    assert assessment.feedback.value is None
+    assert assessment.feedback.error is None
+
+
+def test_log_feedback_invalid_parameters():
     # Test with a non-AssessmentSource object that is not None
     with pytest.raises(MlflowException, match=r"`source` must be an instance of"):
         Feedback(
@@ -280,189 +336,304 @@ def test_log_feedback_invalid_parameters(tracking_uri):
         )
 
 
-def test_update_feedback(store, tracking_uri):
-    feedback = Feedback(
+def test_update_feedback(trace_id):
+    assessment_id = mlflow.log_feedback(
+        trace_id=trace_id,
         name="faithfulness",
         value=1.0,
         rationale="This answer is very faithful.",
         metadata={"model": "gpt-4o-mini"},
+    ).assessment_id
+
+    updated_feedback = Feedback(
+        name="faithfulness",
+        value=0,
+        rationale="This answer is not faithful.",
+        metadata={"reason": "human override"},
     )
     mlflow.update_assessment(
-        assessment_id="1234",
-        trace_id="tr-1234",
-        assessment=feedback,
+        assessment_id=assessment_id,
+        trace_id=trace_id,
+        assessment=updated_feedback,
     )
 
-    assert store.update_assessment.call_count == 1
-    call_args = store.update_assessment.call_args[1]
-    assert call_args["trace_id"] == "tr-1234"
-    assert call_args["assessment_id"] == "1234"
-    assert call_args["name"] == "faithfulness"
-    assert call_args["expectation"] is None
-    assert call_args["feedback"] == FeedbackValue(value=1.0)
-    assert call_args["rationale"] == "This answer is very faithful."
-    assert call_args["metadata"] == {"model": "gpt-4o-mini"}
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert assessment.name == "faithfulness"
+    assert assessment.trace_id == trace_id
+    assert assessment.feedback.value == 0
+    assert assessment.feedback.error is None
+    assert assessment.rationale == "This answer is not faithful."
+    assert assessment.metadata == {
+        "model": "gpt-4o-mini",
+        "reason": "human override",
+    }
 
 
-def test_override_feedback(store, tracking_uri):
-    # Mock the store's get_assessment method to return a feedback
-    old_feedback = Feedback(
-        trace_id="tr-321",
+def test_override_feedback(trace_id):
+    assessment_id = mlflow.log_feedback(
+        trace_id=trace_id,
         name="faithfulness",
         value=0.5,
         source=_LLM_ASSESSMENT_SOURCE,
         rationale="Original feedback",
         metadata={"model": "gpt-3.5"},
-    )
-    old_feedback.assessment_id = "a-1234"
-    store.get_assessment.return_value = old_feedback
+    ).assessment_id
 
-    mlflow.override_feedback(
-        trace_id="tr-321",
-        assessment_id="a-1234",
+    new_assessment_id = mlflow.override_feedback(
+        trace_id=trace_id,
+        assessment_id=assessment_id,
         value=1.0,
         source=_LLM_ASSESSMENT_SOURCE,
         rationale="This answer is very faithful.",
         metadata={"model": "gpt-4o-mini"},
-    )
+    ).assessment_id
 
-    # assert that the old feedback is fetched
-    store.get_assessment.assert_called_once_with("tr-321", "a-1234")
-
-    # assert that the new feedback is created
-    assert store.create_assessment.call_count == 1
-    assessment = store.create_assessment.call_args[0][0]
+    # New assessment should have the same trace_id as the original assessment
+    assessment = mlflow.get_assessment(trace_id, new_assessment_id)
+    assert assessment.trace_id == trace_id
     assert assessment.name == "faithfulness"
-    assert assessment.trace_id == "tr-321"
     assert assessment.span_id is None
     assert assessment.source == _LLM_ASSESSMENT_SOURCE
     assert assessment.create_time_ms is not None
     assert assessment.last_update_time_ms is not None
-    assert assessment.feedback.value == 1.0
-    assert assessment.feedback.error is None
-    assert assessment.expectation is None
+    assert assessment.value == 1.0
+    assert assessment.error is None
     assert assessment.rationale == "This answer is very faithful."
     assert assessment.metadata == {"model": "gpt-4o-mini"}
-    assert assessment.overrides == "a-1234"
+    assert assessment.overrides == assessment_id
+    assert assessment.valid is True
+
+    # Original assessment should be invalidated
+    original_assessment = mlflow.get_assessment(trace_id, assessment_id)
+    assert original_assessment.valid is False
+    assert original_assessment.feedback.value == 0.5
 
 
-def test_delete_assessment(store, tracking_uri):
-    mlflow.delete_assessment(trace_id="tr-1234", assessment_id="1234")
+def test_delete_assessment(trace_id):
+    assessment_id = mlflow.log_feedback(
+        trace_id=trace_id,
+        name="faithfulness",
+        value=1.0,
+    ).assessment_id
 
-    assert store.delete_assessment.call_count == 1
-    call_args = store.delete_assessment.call_args[1]
-    assert call_args["assessment_id"] == "1234"
-    assert call_args["trace_id"] == "tr-1234"
+    mlflow.delete_assessment(trace_id=trace_id, assessment_id=assessment_id)
 
+    with pytest.raises(MlflowException, match=r"Assessment with ID"):
+        assert mlflow.get_assessment(trace_id, assessment_id) is None
 
-def test_assessment_apis_only_available_in_databricks():
-    with pytest.raises(MlflowException, match=r"This API is currently only available"):
-        mlflow.log_assessment(trace_id="1234", assessment=Feedback(name="test", value=1.0))
-
-    with pytest.raises(MlflowException, match=r"This API is currently only available"):
-        mlflow.log_expectation(
-            trace_id="1234", name="expected_answer", value="MLflow", source=_HUMAN_ASSESSMENT_SOURCE
-        )
-
-    with pytest.raises(MlflowException, match=r"This API is currently only available"):
-        mlflow.log_feedback(
-            trace_id="1234", name="faithfulness", value=1.0, source=_LLM_ASSESSMENT_SOURCE
-        )
-
-    with pytest.raises(MlflowException, match=r"This API is currently only available"):
-        mlflow.update_assessment(
-            trace_id="1234",
-            assessment_id="1234",
-            assessment=Feedback(name="faithfulness", value=1.0),
-        )
-
-    with pytest.raises(MlflowException, match=r"This API is currently only available"):
-        mlflow.delete_assessment(trace_id="1234", assessment_id="1234")
+    # Assessment should be deleted from the trace
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 0
 
 
-def test_search_traces_with_assessments(store, tracking_uri):
-    # Create a trace info with an assessment
-    assessment = Feedback(
-        trace_id="test",
-        name="test",
-        value="test",
-        source=AssessmentSource(source_id="test", source_type=AssessmentSourceType.HUMAN),
-        create_time_ms=0,
-        last_update_time_ms=0,
-    )
-
-    trace_info = TraceInfoV2(
-        request_id="test",
-        experiment_id="test",
-        timestamp_ms=0,
-        execution_time_ms=0,
-        status=TraceStatus.OK,
-        tags={"mlflow.artifactLocation": "test"},
-        assessments=[assessment],  # Include the assessment here
-    )
-
-    # Mock the search_traces to return our trace_info
-    store.search_traces.return_value = ([trace_info, trace_info], None)
-
-    # Now when search_traces is called, it should use our trace_info with the assessment
-    with mock.patch(
-        "mlflow.tracing.client.TracingClient._download_trace_data", return_value=TraceData()
-    ):
-        res = mlflow.search_traces(
-            experiment_ids=["0"],
-            max_results=2,
-            return_type="list",
-        )
-
-    # Verify the results
-    assert len(res) == 2
-    for trace in res:
-        assert trace.info.assessments is not None
-        assert len(trace.info.assessments) == 1
-        assert trace.info.assessments[0].trace_id == "test"
-        assert trace.info.assessments[0].name == "test"
-
-    # Verify the search_traces was called
-    assert store.search_traces.call_count == 1
-
-    # We no longer expect get_trace_info to be called
-    assert store.get_trace_info.call_count == 0
-
-
-def test_log_feedback_default_source(store, tracking_uri):
+def test_log_feedback_default_source(trace_id):
     # Test that the default CODE source is used when no source is provided
     feedback = Feedback(
-        trace_id="1234",
+        trace_id=trace_id,
         name="faithfulness",
         value=1.0,
     )
-    mlflow.log_assessment(trace_id="1234", assessment=feedback)
+    mlflow.log_assessment(trace_id=trace_id, assessment=feedback)
 
-    assert store.create_assessment.call_count == 1
-    assessment = store.create_assessment.call_args[0][0]
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
     assert assessment.name == "faithfulness"
-    assert assessment.trace_id == "1234"
+    assert assessment.trace_id == trace_id
     assert assessment.source.source_type == AssessmentSourceType.CODE
     assert assessment.source.source_id == "default"
     assert assessment.feedback.value == 1.0
 
 
-def test_log_expectation_default_source(store, tracking_uri):
-    # Test that the default CODE source is used when no source is provided
+def test_log_expectation_default_source(trace_id):
+    # Test that the default HUMAN source is used when no source is provided
     expectation = Expectation(
-        trace_id="1234",
+        trace_id=trace_id,
         name="expected_answer",
         value="MLflow",
     )
-    mlflow.log_assessment(trace_id="1234", assessment=expectation)
+    mlflow.log_assessment(trace_id=trace_id, assessment=expectation)
 
-    assert store.create_assessment.call_count == 1
-    assessment = store.create_assessment.call_args[0][0]
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
     assert assessment.name == "expected_answer"
-    assert assessment.trace_id == "1234"
+    assert assessment.trace_id == trace_id
     assert assessment.source.source_type == AssessmentSourceType.HUMAN
     assert assessment.source.source_id == "default"
     assert assessment.expectation.value == "MLflow"
+
+
+def test_log_issue(trace_id, tracking_uri):
+    if tracking_uri.startswith("file:"):
+        pytest.skip("Issue APIs are not supported with file-based tracking URI")
+
+    tracing_client = mlflow.MlflowClient()._tracing_client
+    issue = tracing_client._create_issue(
+        experiment_id="0",
+        name="timeout_error",
+        description="Timeout errors in API calls",
+        status=IssueStatus.PENDING,
+    )
+
+    mlflow.log_issue(
+        trace_id=trace_id,
+        issue_id=issue.issue_id,
+        issue_name="timeout_error",
+        source=_CODE_ASSESSMENT_SOURCE,
+        rationale="Request exceeded 30 second timeout",
+        metadata={"severity": "high", "affected_count": "150"},
+    )
+
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert isinstance(assessment, IssueReference)
+    assert assessment.trace_id == trace_id
+    assert assessment.name == issue.issue_id
+    assert assessment.issue_id == issue.issue_id
+    assert assessment.issue_name == "timeout_error"
+    assert assessment.span_id is None
+    assert assessment.source == _CODE_ASSESSMENT_SOURCE
+    assert assessment.create_time_ms is not None
+    assert assessment.last_update_time_ms is not None
+    assert assessment.issue.issue_name == "timeout_error"
+    assert assessment.rationale == "Request exceeded 30 second timeout"
+    assert assessment.metadata == {"severity": "high", "affected_count": "150"}
+
+
+def test_log_issue_default_source(trace_id, tracking_uri):
+    if tracking_uri.startswith("file:"):
+        pytest.skip("Issue APIs are not supported with file-based tracking URI")
+
+    tracing_client = mlflow.MlflowClient()._tracing_client
+    issue = tracing_client._create_issue(
+        experiment_id="0",
+        name="connection_issue",
+        description="Connection issues",
+        status=IssueStatus.PENDING,
+    )
+
+    # Test that the default LLM_JUDGE source is used when no source is provided
+    mlflow.log_issue(
+        trace_id=trace_id,
+        issue_id=issue.issue_id,
+        issue_name="connection_issue",
+    )
+
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert assessment.name == issue.issue_id
+    assert assessment.issue_id == issue.issue_id
+    assert assessment.issue_name == "connection_issue"
+    assert assessment.trace_id == trace_id
+    assert assessment.source.source_type == AssessmentSourceType.LLM_JUDGE
+    assert assessment.source.source_id == "default"
+
+
+def test_log_issue_with_run_id_and_span_id(tracking_uri):
+    if tracking_uri.startswith("file:"):
+        pytest.skip("Issue APIs are not supported with file-based tracking URI")
+
+    tracing_client = mlflow.MlflowClient()._tracing_client
+    issue = tracing_client._create_issue(
+        experiment_id="0",
+        name="data_quality_issue",
+        description="Data quality issues",
+        status=IssueStatus.PENDING,
+    )
+
+    with mlflow.start_span(name="test_span") as span:
+        mlflow.log_issue(
+            trace_id=span.trace_id,
+            issue_id=issue.issue_id,
+            issue_name="data_quality_issue",
+            source=_LLM_ASSESSMENT_SOURCE,
+            run_id="run-12345",
+            rationale="Input data contains missing values in critical fields",
+            metadata={"category": "data", "priority": "high"},
+            span_id=span.span_id,
+        )
+    mlflow.flush_trace_async_logging()
+    trace = mlflow.get_trace(span.trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert assessment.issue_id == issue.issue_id
+    assert assessment.issue_name == "data_quality_issue"
+    assert assessment.trace_id == span.trace_id
+    assert assessment.span_id == span.span_id
+    assert assessment.source == _LLM_ASSESSMENT_SOURCE
+    assert assessment.rationale == "Input data contains missing values in critical fields"
+    assert assessment.metadata == {"category": "data", "priority": "high"}
+
+
+def test_log_issue_without_issue_name(trace_id, tracking_uri):
+    if tracking_uri.startswith("file:"):
+        pytest.skip("Issue APIs are not supported with file-based tracking URI")
+
+    tracing_client = mlflow.MlflowClient()._tracing_client
+    issue = tracing_client._create_issue(
+        experiment_id="0",
+        name="timeout_error",
+        description="Request exceeded 30 second timeout",
+        status=IssueStatus.PENDING,
+    )
+    mlflow.log_issue(
+        trace_id=trace_id,
+        issue_id=issue.issue_id,
+        source=_CODE_ASSESSMENT_SOURCE,
+        rationale="Request exceeded 30 second timeout",
+        metadata={"severity": "high", "affected_count": "150"},
+    )
+    trace = mlflow.get_trace(trace_id)
+    assessment = trace.info.assessments[0]
+    assert assessment.issue_id == issue.issue_id
+    assert assessment.issue_name == "timeout_error"
+
+    fetched_issue = tracing_client._get_issue(issue.issue_id)
+    assert fetched_issue.name == issue.name
+    assert fetched_issue.description == issue.description
+    assert fetched_issue.status == issue.status
+
+
+def test_log_issue_with_invalid_issue_name(trace_id, tracking_uri):
+    if tracking_uri.startswith("file:"):
+        pytest.skip("Issue APIs are not supported with file-based tracking URI")
+
+    tracing_client = mlflow.MlflowClient()._tracing_client
+    issue = tracing_client._create_issue(
+        experiment_id="0",
+        name="timeout_error",
+        description="Timeout errors in API calls",
+        status=IssueStatus.PENDING,
+    )
+
+    with pytest.raises(
+        MlflowException, match=r"Provided issue name 'wrong_name' does not match the issue name"
+    ):
+        mlflow.log_issue(
+            trace_id=trace_id,
+            issue_id=issue.issue_id,
+            issue_name="wrong_name",
+        )
+
+
+def test_log_issue_with_invalid_issue_id(trace_id, tracking_uri):
+    if tracking_uri.startswith("file:"):
+        pytest.skip("Issue APIs are not supported with file-based tracking URI")
+
+    with pytest.raises(
+        MlflowException,
+        match=r"Issue with ID 'iss-nonexistent' not found",
+    ):
+        mlflow.log_issue(
+            trace_id=trace_id,
+            issue_id="iss-nonexistent",
+            issue_name="some_issue",
+        )
 
 
 def test_log_feedback_and_exception_blocks_positional_args():
@@ -472,20 +643,23 @@ def test_log_feedback_and_exception_blocks_positional_args():
     with pytest.raises(TypeError, match=r"log_expectation\(\) takes 0 positional"):
         mlflow.log_expectation("tr-1234", "expected_answer", "MLflow")
 
+    with pytest.raises(TypeError, match=r"log_issue\(\) takes 0 positional"):
+        mlflow.log_issue("tr-1234", "iss-12345", "timeout_error")
+
 
 @pytest.mark.parametrize("legacy_api", [True, False])
-def test_log_assessment_on_in_progress_trace(store, tracking_uri, legacy_api):
+def test_log_assessment_on_in_progress_trace(trace_id, legacy_api):
     @mlflow.trace
     def func(x: int, y: int) -> int:
-        trace_id = mlflow.get_active_trace_id()
+        active_trace_id = mlflow.get_active_trace_id()
         if legacy_api:
-            mlflow.log_assessment(trace_id, Feedback(name="feedback", value=1.0))
-            mlflow.log_assessment(trace_id, Expectation(name="expectation", value="MLflow"))
-            mlflow.log_assessment("other_trace_id", Feedback(name="other", value=2.0))
+            mlflow.log_assessment(active_trace_id, Feedback(name="feedback", value=1.0))
+            mlflow.log_assessment(active_trace_id, Expectation(name="expectation", value="MLflow"))
+            mlflow.log_assessment(trace_id, Feedback(name="other", value=2.0))
         else:
-            mlflow.log_feedback(trace_id=trace_id, name="feedback", value=1.0)
-            mlflow.log_expectation(trace_id=trace_id, name="expectation", value="MLflow")
-            mlflow.log_feedback(trace_id="other_trace_id", name="other", value=2.0)
+            mlflow.log_feedback(trace_id=active_trace_id, name="feedback", value=1.0)
+            mlflow.log_expectation(trace_id=active_trace_id, name="expectation", value="MLflow")
+            mlflow.log_feedback(trace_id=trace_id, name="other", value=2.0)
         return x + y
 
     assert func(1, 2) == 3
@@ -493,25 +667,21 @@ def test_log_assessment_on_in_progress_trace(store, tracking_uri, legacy_api):
     mlflow.flush_trace_async_logging()
 
     # Two assessments should be logged as a part of StartTraceV3 call
-    store.start_trace_v3.assert_called_once()
-    trace = store.start_trace_v3.call_args[1]["trace"]
-    assert trace.info.request_id == mlflow.get_last_active_trace_id()
+    trace = mlflow.get_trace(mlflow.get_last_active_trace_id())
     assert len(trace.info.assessments) == 2
-    assert trace.info.assessments[0].name == "feedback"
-    assert trace.info.assessments[0].feedback.value == 1.0
-    assert trace.info.assessments[1].name == "expectation"
-    assert trace.info.assessments[1].expectation.value == "MLflow"
+    assessments = {a.name: a for a in trace.info.assessments}
+    assert assessments["feedback"].value == 1.0
+    assert assessments["expectation"].value == "MLflow"
 
-    # CreateAssessment should be called for the last assessment on the other trace
-    store.create_assessment.assert_called_once()
-    assessment = store.create_assessment.call_args[0][0]
-    assert assessment.trace_id == "other_trace_id"
-    assert assessment.name == "other"
-    assert assessment.feedback.value == 2.0
+    # Assessment on the other trace
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assert trace.info.assessments[0].name == "other"
+    assert trace.info.assessments[0].feedback.value == 2.0
 
 
 @pytest.mark.asyncio
-async def test_log_assessment_on_in_progress_trace_async(store, tracking_uri):
+async def test_log_assessment_on_in_progress_trace_async():
     @mlflow.trace
     async def func(x: int, y: int) -> int:
         trace_id = mlflow.get_active_trace_id()
@@ -523,40 +693,35 @@ async def test_log_assessment_on_in_progress_trace_async(store, tracking_uri):
 
     mlflow.flush_trace_async_logging()
 
-    store.create_assessment.assert_not_called()
-
-    store.start_trace_v3.assert_called_once()
-    trace = store.start_trace_v3.call_args[1]["trace"]
-    assert trace.info.request_id == mlflow.get_last_active_trace_id()
-    assert len(trace.info.assessments) == 2
-    assert trace.info.assessments[0].name == "feedback"
-    assert trace.info.assessments[0].feedback.value == 1.0
-    assert trace.info.assessments[1].name == "expectation"
-    assert trace.info.assessments[1].expectation.value == "MLflow"
+    trace = mlflow.get_trace(mlflow.get_last_active_trace_id())
+    trace_info = trace.info
+    assert len(trace_info.assessments) == 2
+    assessments = {a.name: a for a in trace_info.assessments}
+    assert assessments["feedback"].feedback.value == 1.0
+    assert assessments["expectation"].expectation.value == "MLflow"
 
 
-def test_log_assessment_on_in_progress_with_span_id(store, tracking_uri):
+def test_log_assessment_on_in_progress_with_span_id():
     with mlflow.start_span(name="test_span") as span:
-        mlflow.log_assessment(
-            trace_id=span.trace_id,
-            assessment=Feedback(name="feedback", value=1.0, span_id=span.span_id),
-        )
+        # Only proceed if we have a real span (not NO_OP)
+        if span.span_id is not None and span.trace_id != "MLFLOW_NO_OP_SPAN_TRACE_ID":
+            mlflow.log_assessment(
+                trace_id=span.trace_id,
+                assessment=Feedback(name="feedback", value=1.0, span_id=span.span_id),
+            )
 
     mlflow.flush_trace_async_logging()
 
     # Two assessments should be logged as a part of StartTraceV3 call
-    store.start_trace_v3.assert_called_once()
-    trace = store.start_trace_v3.call_args[1]["trace"]
-    assert trace.info.request_id == mlflow.get_last_active_trace_id()
-    assert len(trace.info.assessments) == 1
-    assert trace.info.assessments[0].name == "feedback"
-    assert trace.info.assessments[0].feedback.value == 1.0
-    assert trace.info.assessments[0].span_id == span.span_id
-
-    store.create_assessment.assert_not_called()
+    trace = mlflow.get_trace(mlflow.get_last_active_trace_id())
+    trace_info = trace.info
+    assert len(trace_info.assessments) == 1
+    assert trace_info.assessments[0].name == "feedback"
+    assert trace_info.assessments[0].feedback.value == 1.0
+    assert trace_info.assessments[0].span_id == span.span_id
 
 
-def test_log_assessment_on_in_progress_trace_works_when_tracing_is_disabled(store, tracking_uri):
+def test_log_assessment_on_in_progress_trace_works_when_tracing_is_disabled():
     # Calling log_assessment to an active trace should not fail when tracing is disabled.
     mlflow.tracing.disable()
 
@@ -570,6 +735,353 @@ def test_log_assessment_on_in_progress_trace_works_when_tracing_is_disabled(stor
 
     mlflow.flush_trace_async_logging()
 
-    # Neither CreateAssessment nor StartTraceV3 should be called
-    store.create_assessment.assert_not_called()
-    store.start_trace_v3.assert_not_called()
+
+def test_get_assessment(trace_id):
+    assessment_id = mlflow.log_feedback(
+        trace_id=trace_id,
+        name="faithfulness",
+        value=1.0,
+    ).assessment_id
+
+    result = mlflow.get_assessment(trace_id, assessment_id)
+
+    assert isinstance(result, Feedback)
+    assert result.name == "faithfulness"
+    assert result.trace_id == trace_id
+    assert result.value == 1.0
+    assert result.error is None
+    assert result.source.source_type == AssessmentSourceType.CODE
+    assert result.source.source_id == "default"
+    assert result.create_time_ms is not None
+    assert result.last_update_time_ms is not None
+    assert result.valid is True
+    assert result.overrides is None
+
+
+def test_search_traces_with_assessments():
+    # Create traces with assessments
+    with mlflow.start_span(name="trace_1") as span_1:
+        mlflow.log_feedback(
+            trace_id=span_1.trace_id,
+            name="feedback_1",
+            value=1.0,
+        )
+        mlflow.log_expectation(
+            trace_id=span_1.trace_id,
+            name="expectation_1",
+            value="test",
+            source=AssessmentSource(source_id="test", source_type=AssessmentSourceType.LLM_JUDGE),
+        )
+        with mlflow.start_span(name="child") as span_1_child:
+            mlflow.log_feedback(
+                trace_id=span_1_child.trace_id,
+                name="feedback_2",
+                value=1.0,
+                span_id=span_1_child.span_id,
+            )
+
+    with mlflow.start_span(name="trace_2") as span_2:
+        mlflow.log_feedback(
+            trace_id=span_2.trace_id,
+            name="feedback_3",
+            value=1.0,
+        )
+
+    mlflow.flush_trace_async_logging()
+
+    traces = mlflow.search_traces(
+        locations=["0"],
+        max_results=2,
+        return_type="list",
+        order_by=["timestamp_ms"],
+    )
+    # Verify the results
+    assert len(traces) == 2
+    assert len(traces[0].info.assessments) == 3
+
+    assessments = {a.name: a for a in traces[0].info.assessments}
+    assert assessments["feedback_1"].trace_id == span_1.trace_id
+    assert assessments["feedback_1"].name == "feedback_1"
+    assert assessments["feedback_1"].value == 1.0
+    assert assessments["expectation_1"].trace_id == span_1.trace_id
+    assert assessments["expectation_1"].name == "expectation_1"
+    assert assessments["expectation_1"].value == "test"
+    assert assessments["feedback_2"].trace_id == span_1_child.trace_id
+    assert assessments["feedback_2"].name == "feedback_2"
+    assert assessments["feedback_2"].value == 1.0
+
+    assert len(traces[1].info.assessments) == 1
+    assessment = traces[1].info.assessments[0]
+    assert assessment.trace_id == span_2.trace_id
+    assert assessment.name == "feedback_3"
+    assert assessment.value == 1.0
+
+
+@pytest.mark.parametrize("source_type", ["AI_JUDGE", AssessmentSourceType.AI_JUDGE])
+def test_log_feedback_ai_judge_deprecation_warning(trace_id, source_type):
+    with pytest.warns(FutureWarning, match="AI_JUDGE is deprecated. Use LLM_JUDGE instead."):
+        ai_judge_source = AssessmentSource(source_type=source_type, source_id="gpt-4")
+
+    mlflow.log_feedback(
+        trace_id=trace_id,
+        name="quality",
+        value=0.8,
+        source=ai_judge_source,
+        rationale="AI evaluation",
+    )
+
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert assessment.source.source_type == AssessmentSourceType.LLM_JUDGE
+    assert assessment.source.source_id == "gpt-4"
+    assert assessment.name == "quality"
+    assert assessment.feedback.value == 0.8
+    assert assessment.rationale == "AI evaluation"
+
+
+def test_log_issue_reference(trace_id, tracking_uri):
+    if tracking_uri.startswith("file:"):
+        pytest.skip("Issue APIs are not supported with file-based tracking URI")
+
+    tracing_client = mlflow.MlflowClient()._tracing_client
+    issue = tracing_client._create_issue(
+        experiment_id="0",
+        name="timeout_error",
+        description="Timeout errors in API calls",
+        status=IssueStatus.PENDING,
+    )
+
+    issue_ref = IssueReference(
+        issue_id=issue.issue_id,
+        issue_name="timeout_error",
+        source=_CODE_ASSESSMENT_SOURCE,
+        metadata={"severity": "high", "affected_count": "150"},
+    )
+    mlflow.log_assessment(trace_id=trace_id, assessment=issue_ref)
+
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert isinstance(assessment, IssueReference)
+    assert assessment.trace_id == trace_id
+    assert assessment.name == issue.issue_id
+    assert assessment.issue_id == issue.issue_id
+    assert assessment.issue_name == "timeout_error"
+    assert assessment.span_id is None
+    assert assessment.source == _CODE_ASSESSMENT_SOURCE
+    assert assessment.create_time_ms is not None
+    assert assessment.last_update_time_ms is not None
+    assert assessment.issue.issue_name == "timeout_error"
+    assert assessment.expectation is None
+    assert assessment.feedback is None
+    assert assessment.metadata == {"severity": "high", "affected_count": "150"}
+
+
+def test_log_issue_reference_invalid_parameters():
+    with pytest.raises(MlflowException, match=r"The `issue_id` field must be specified"):
+        IssueReference(
+            issue_id=None,
+            issue_name="test_issue",
+            source=_CODE_ASSESSMENT_SOURCE,
+        )
+
+
+def test_log_issue_reference_default_source(trace_id, tracking_uri):
+    if tracking_uri.startswith("file:"):
+        pytest.skip("Issue APIs are not supported with file-based tracking URI")
+
+    tracing_client = mlflow.MlflowClient()._tracing_client
+    issue = tracing_client._create_issue(
+        experiment_id="0",
+        name="connection_issue",
+        description="Connection issues",
+        status=IssueStatus.PENDING,
+    )
+
+    issue_ref = IssueReference(
+        issue_id=issue.issue_id,
+        issue_name="connection_issue",
+    )
+    mlflow.log_assessment(trace_id=trace_id, assessment=issue_ref)
+
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 1
+    assessment = trace.info.assessments[0]
+    assert assessment.name == issue.issue_id
+    assert assessment.issue_name == "connection_issue"
+    assert assessment.trace_id == trace_id
+    assert assessment.issue_id == issue.issue_id
+    assert assessment.source.source_type == AssessmentSourceType.LLM_JUDGE
+    assert assessment.source.source_id == "default"
+
+
+def test_get_issue_reference_assessment(trace_id):
+    issue_ref = IssueReference(
+        issue_id="iss-55555",
+        issue_name="performance_issue",
+        metadata={"category": "latency"},
+    )
+    assessment_id = mlflow.log_assessment(trace_id=trace_id, assessment=issue_ref).assessment_id
+
+    result = mlflow.get_assessment(trace_id, assessment_id)
+
+    assert isinstance(result, IssueReference)
+    assert result.name == "iss-55555"
+    assert result.issue_name == "performance_issue"
+    assert result.trace_id == trace_id
+    assert result.issue_id == "iss-55555"
+    assert result.source.source_type == AssessmentSourceType.LLM_JUDGE
+    assert result.source.source_id == "default"
+    assert result.create_time_ms is not None
+    assert result.last_update_time_ms is not None
+    assert result.metadata == {"category": "latency"}
+
+
+def test_log_multiple_assessment_types(trace_id):
+    feedback = Feedback(
+        name="accuracy",
+        value=0.95,
+        source=_LLM_ASSESSMENT_SOURCE,
+    )
+    mlflow.log_assessment(trace_id=trace_id, assessment=feedback)
+
+    expectation = Expectation(
+        name="expected_output",
+        value="MLflow",
+        source=_HUMAN_ASSESSMENT_SOURCE,
+    )
+    mlflow.log_assessment(trace_id=trace_id, assessment=expectation)
+
+    issue_ref = IssueReference(
+        issue_id="iss-11111",
+        issue_name="data_quality_issue",
+        source=_CODE_ASSESSMENT_SOURCE,
+    )
+    mlflow.log_assessment(trace_id=trace_id, assessment=issue_ref)
+
+    trace = mlflow.get_trace(trace_id)
+    assert len(trace.info.assessments) == 3
+
+    assessments_by_type = {}
+    for a in trace.info.assessments:
+        if isinstance(a, Feedback):
+            assessments_by_type["feedback"] = a
+        elif isinstance(a, Expectation):
+            assessments_by_type["expectation"] = a
+        elif isinstance(a, IssueReference):
+            assessments_by_type["issue"] = a
+
+    assert assessments_by_type["feedback"].name == "accuracy"
+    assert assessments_by_type["feedback"].value == 0.95
+
+    assert assessments_by_type["expectation"].name == "expected_output"
+    assert assessments_by_type["expectation"].value == "MLflow"
+
+    assert assessments_by_type["issue"].name == "iss-11111"
+    assert assessments_by_type["issue"].issue_name == "data_quality_issue"
+    assert assessments_by_type["issue"].issue_id == "iss-11111"
+
+
+def test_log_feedback_in_distributed_trace_same_process():
+    captured_headers = {}
+    tm = InMemoryTraceManager.get_instance()
+
+    @mlflow.trace(name="root")
+    def root():
+        nonlocal captured_headers
+        captured_headers = get_tracing_context_headers_for_http_request()
+        trace_id = mlflow.get_active_trace_id()
+        with tm.get_trace(trace_id) as t:
+            assert t is not None
+            assert not t.is_remote_trace
+
+    root()
+
+    root_trace_id = mlflow.get_last_active_trace_id()
+    assert root_trace_id is not None
+
+    with set_tracing_context_from_http_request_headers(captured_headers):
+
+        @mlflow.trace(name="child")
+        def child():
+            trace_id = mlflow.get_active_trace_id()
+            return mlflow.log_feedback(
+                trace_id=trace_id,
+                name="child_was_called",
+                value="yes",
+            )
+
+        child()
+
+    mlflow.flush_trace_async_logging()
+    trace = mlflow.get_trace(root_trace_id)
+    assert len(trace.info.assessments) == 1
+    assert trace.info.assessments[0].name == "child_was_called"
+    assert trace.info.assessments[0].feedback.value == "yes"
+
+
+def test_log_feedback_in_distributed_trace_cross_process():
+    captured_headers = {}
+
+    @mlflow.trace(name="root")
+    def root():
+        nonlocal captured_headers
+        captured_headers = get_tracing_context_headers_for_http_request()
+
+    root()
+    mlflow.flush_trace_async_logging()
+
+    root_trace_id = mlflow.get_last_active_trace_id()
+    tm = InMemoryTraceManager.get_instance()
+    with tm.get_trace(root_trace_id) as t:
+        assert t is None
+
+    mock_store = mock.MagicMock()
+    mock_assessment = mock.MagicMock()
+    mock_assessment.assessment_id = "a-test-assessment-id"
+    mock_store.create_assessment.return_value = mock_assessment
+
+    with mock.patch("mlflow.tracing.client._get_store", return_value=mock_store):
+        with set_tracing_context_from_http_request_headers(captured_headers):
+
+            @mlflow.trace(name="child")
+            def child():
+                trace_id = mlflow.get_active_trace_id()
+                return mlflow.log_feedback(
+                    trace_id=trace_id,
+                    name="child_was_called",
+                    value="yes",
+                )
+
+            result = child()
+
+        mock_store.create_assessment.assert_called_once()
+        called_assessment = mock_store.create_assessment.call_args[0][0]
+        assert called_assessment.name == "child_was_called"
+        assert called_assessment.feedback.value == "yes"
+        assert result.assessment_id == "a-test-assessment-id"
+
+
+def test_log_assessment_active_trace_not_in_memory():
+    null_cm = mock.MagicMock()
+    null_cm.__enter__.return_value = None
+    null_cm.__exit__.return_value = False
+
+    mock_store = mock.MagicMock()
+
+    with mlflow.start_span(name="root"):
+        with (
+            mock.patch.object(
+                InMemoryTraceManager.get_instance(), "get_trace", return_value=null_cm
+            ),
+            mock.patch("mlflow.tracing.client._get_store", return_value=mock_store),
+        ):
+            result = mlflow.log_feedback(
+                trace_id=mlflow.get_active_trace_id(),
+                name="test_feedback",
+                value=1.0,
+            )
+            mock_store.create_assessment.assert_not_called()
+            assert result is not None
+            assert result.assessment_id is None

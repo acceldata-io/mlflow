@@ -15,7 +15,7 @@ export const ExperimentLoggedModelDetailsModelVersionsList = ({
 }) => {
   const loggedModels = useMemo(() => [loggedModel], [loggedModel]);
   const { theme } = useDesignSystemTheme();
-  const modelVersions = useExperimentLoggedModelRegisteredVersions({ loggedModels });
+  const { modelVersions } = useExperimentLoggedModelRegisteredVersions({ loggedModels });
 
   if (isEmpty(modelVersions)) {
     return empty ?? <>-</>;
@@ -25,6 +25,7 @@ export const ExperimentLoggedModelDetailsModelVersionsList = ({
     <Overflow>
       {modelVersions?.map(({ displayedName, version, link }) => (
         <Link
+          componentId="mlflow.logged_models.details.model_version_link"
           to={link}
           key={`${displayedName}-${version}`}
           css={{ display: 'flex', alignItems: 'center', gap: theme.spacing.sm }}

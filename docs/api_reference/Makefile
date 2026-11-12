@@ -64,6 +64,10 @@ javadocs:
 rdocs:
 	./build-rdoc.sh
 
+.PHONY: tsdocs
+tsdocs:
+	./build-tsdoc.sh
+
 .PHONY: test-examples
 test-examples:
 	@pytest --no-cov .examples
@@ -72,9 +76,13 @@ test-examples:
 gateway-api-docs:
 	@python gateway_api_docs.py
 
+.PHONY: mcp-server-registry-api-docs
+mcp-server-registry-api-docs:
+	@python mcp_server_registry_api_docs.py
+
 # Builds only the RST-based documentation (i.e., everything but Java & R docs)
 .PHONY: rsthtml
-rsthtml: gateway-api-docs
+rsthtml: gateway-api-docs mcp-server-registry-api-docs
 	$(SPHINXBUILD) -b html $(ALLSPHINXOPTS) $(BUILDDIR)/html
 	@echo
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/html."
@@ -85,7 +93,7 @@ view:
 	python -m http.server --directory build/html
 
 .PHONY: html
-html: rdocs rsthtml javadocs
+html: rdocs rsthtml javadocs tsdocs
 
 .PHONY: dirhtml
 dirhtml:

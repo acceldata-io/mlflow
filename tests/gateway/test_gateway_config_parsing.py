@@ -6,9 +6,10 @@ import yaml
 from mlflow.exceptions import MlflowException
 from mlflow.gateway.config import (
     AnthropicConfig,
+    EndpointConfig,
+    LiteLLMConfig,
     OpenAIConfig,
-    RouteConfig,
-    _load_route_config,
+    _load_gateway_config,
     _resolve_api_key_from_input,
     _save_route_config,
 )
@@ -76,6 +77,8 @@ def test_assemble_uri_path(paths, expected):
 
 
 def test_api_key_parsing_env(tmp_path, monkeypatch):
+    # Env-var resolution requires the flag to be enabled
+    monkeypatch.setenv("MLFLOW_GATEWAY_RESOLVE_API_KEY_FROM_ENV", "true")
     monkeypatch.setenv("KEY_AS_ENV", "my_key")
 
     assert _resolve_api_key_from_input("$KEY_AS_ENV") == "my_key"
@@ -87,6 +90,9 @@ def test_api_key_parsing_env(tmp_path, monkeypatch):
 
     assert _resolve_api_key_from_input(string_key) == string_key
 
+    # File-based resolution requires the flag to be enabled
+    monkeypatch.setenv("MLFLOW_GATEWAY_RESOLVE_API_KEY_FROM_FILE", "true")
+
     conf_path = tmp_path.joinpath("mykey.conf")
     file_key = "Here is my key that sits safely in a file"
 
@@ -95,11 +101,20 @@ def test_api_key_parsing_env(tmp_path, monkeypatch):
     assert _resolve_api_key_from_input(str(conf_path)) == file_key
 
 
+def test_api_key_env_resolution_blocked_without_flag(monkeypatch):
+    monkeypatch.setenv("KEY_AS_ENV", "my_key")
+    monkeypatch.delenv("MLFLOW_GATEWAY_RESOLVE_API_KEY_FROM_ENV", raising=False)
+
+    # Without the flag, $-prefixed values are returned as literal strings
+    assert _resolve_api_key_from_input("$KEY_AS_ENV") == "$KEY_AS_ENV"
+
+
 def test_api_key_input_exceeding_maximum_filename_length():
     assert _resolve_api_key_from_input("a" * 256) == "a" * 256
 
 
-def test_api_key_parsing_file(tmp_path):
+def test_api_key_parsing_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("MLFLOW_GATEWAY_RESOLVE_API_KEY_FROM_FILE", "true")
     key_path = tmp_path.joinpath("api.key")
     config = {
         "endpoints": [
@@ -120,7 +135,7 @@ def test_api_key_parsing_file(tmp_path):
     key_path.write_text("abc")
     config_path = tmp_path.joinpath("config.yaml")
     config_path.write_text(yaml.safe_dump(config))
-    loaded_config = _load_route_config(config_path)
+    loaded_config = _load_gateway_config(config_path)
 
     assert isinstance(loaded_config.endpoints[0].model.config, AnthropicConfig)
     assert loaded_config.endpoints[0].model.config.anthropic_api_key == "abc"
@@ -131,11 +146,11 @@ def test_route_configuration_parsing(basic_config_dict, tmp_path, monkeypatch):
 
     conf_path.write_text(yaml.safe_dump(basic_config_dict))
 
-    loaded_config = _load_route_config(conf_path)
+    loaded_config = _load_gateway_config(conf_path)
 
     save_path = tmp_path.joinpath("config2.yaml")
     _save_route_config(loaded_config, save_path)
-    loaded_from_save = _load_route_config(save_path)
+    loaded_from_save = _load_gateway_config(save_path)
 
     completions_gpt4 = loaded_from_save.endpoints[0]
     assert completions_gpt4.name == "completions-gpt4"
@@ -176,15 +191,15 @@ def test_route_configuration_parsing(basic_config_dict, tmp_path, monkeypatch):
 def test_convert_route_config_to_routes_payload(basic_config_dict, tmp_path):
     conf_path = tmp_path.joinpath("config.yaml")
     conf_path.write_text(yaml.safe_dump(basic_config_dict))
-    loaded = _load_route_config(conf_path)
+    loaded = _load_gateway_config(conf_path)
 
-    assert all(isinstance(route, RouteConfig) for route in loaded.endpoints)
+    assert all(isinstance(route, EndpointConfig) for route in loaded.endpoints)
 
-    routes = [r.to_route() for r in loaded.endpoints]
+    routes = [r.to_endpoint() for r in loaded.endpoints]
 
     for config in loaded.endpoints:
-        route = [x for x in routes if x.name == config.name][0]
-        assert route.route_type == config.endpoint_type
+        route = next(x for x in routes if x.name == config.name)
+        assert route.endpoint_type == config.endpoint_type
         assert route.model.name == config.model.name
         assert route.model.provider == config.model.provider
         # Pydantic doesn't allow undefined elements to be a part of its serialized object.
@@ -217,7 +232,7 @@ def test_invalid_route_definition(tmp_path):
     conf_path.write_text(yaml.safe_dump(invalid_conf))
 
     with pytest.raises(MlflowException, match=r"The route_type 'invalid/route' is not supported."):
-        _load_route_config(conf_path)
+        _load_gateway_config(conf_path)
 
 
 def test_invalid_provider(tmp_path):
@@ -244,7 +259,7 @@ def test_invalid_provider(tmp_path):
     conf_path.write_text(yaml.safe_dump(invalid_conf))
 
     with pytest.raises(MlflowException, match=r"The provider 'my_provider' is not supported."):
-        _load_route_config(conf_path)
+        _load_gateway_config(conf_path)
 
 
 def test_invalid_model_definition(tmp_path):
@@ -268,7 +283,7 @@ def test_invalid_model_definition(tmp_path):
     with pytest.raises(
         MlflowException, match=re.compile(r"validation error.+openai_api_key", re.DOTALL)
     ):
-        _load_route_config(conf_path)
+        _load_gateway_config(conf_path)
 
     invalid_format_config_key_is_not_string = {
         "endpoints": [
@@ -291,7 +306,7 @@ def test_invalid_model_definition(tmp_path):
         MlflowException,
         match="The api key provided is not a string",
     ):
-        _load_route_config(conf_path)
+        _load_gateway_config(conf_path)
 
     invalid_format_config_key_invalid_path = {
         "endpoints": [
@@ -311,7 +326,8 @@ def test_invalid_model_definition(tmp_path):
     conf_path.write_text(yaml.safe_dump(invalid_format_config_key_invalid_path))
 
     assert (
-        _load_route_config(conf_path).endpoints[0].model.config.openai_api_key == "/not/a/real/path"  # pylint: disable=line-too-long
+        _load_gateway_config(conf_path).endpoints[0].model.config.openai_api_key
+        == "/not/a/real/path"  # pylint: disable=line-too-long
     )
 
     invalid_no_config = {
@@ -333,7 +349,7 @@ def test_invalid_model_definition(tmp_path):
         MlflowException,
         match="A config must be supplied when setting a provider. The provider entry",
     ):
-        _load_route_config(conf_path)
+        _load_gateway_config(conf_path)
 
 
 @pytest.mark.parametrize(
@@ -362,7 +378,7 @@ def test_invalid_route_name(tmp_path, route_name):
     with pytest.raises(
         MlflowException, match="The route name provided contains disallowed characters"
     ):
-        _load_route_config(conf_path)
+        _load_gateway_config(conf_path)
 
 
 def test_default_base_api(tmp_path):
@@ -381,7 +397,7 @@ def test_default_base_api(tmp_path):
     }
     conf_path = tmp_path.joinpath("config.yaml")
     conf_path.write_text(yaml.safe_dump(route_no_base))
-    loaded_conf = _load_route_config(conf_path)
+    loaded_conf = _load_gateway_config(conf_path)
 
     assert loaded_conf.endpoints[0].model.config.openai_api_base == "https://api.openai.com/v1"
 
@@ -418,6 +434,20 @@ def test_duplicate_routes_in_config(tmp_path):
     conf_path = tmp_path.joinpath("config.yaml")
     conf_path.write_text(yaml.safe_dump(route))
     with pytest.raises(
-        MlflowException, match="Duplicate names found in endpoint configurations. Please"
+        MlflowException, match="Duplicate names found in endpoint / route configurations"
     ):
-        _load_route_config(conf_path)
+        _load_gateway_config(conf_path)
+
+
+def test_litellm_config_removes_auth_mode():
+    config = LiteLLMConfig(
+        litellm_provider="bedrock",
+        litellm_auth_config={
+            "auth_mode": "access_keys",
+            "aws_region_name": "us-west-2",
+            "api_key": "test-key",
+        },
+    )
+    assert "auth_mode" not in config.litellm_auth_config
+    assert config.litellm_auth_config["aws_region_name"] == "us-west-2"
+    assert config.litellm_auth_config["api_key"] == "test-key"

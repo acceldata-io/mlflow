@@ -1,35 +1,41 @@
 import { useMemo, useState } from 'react';
-import { useGetExperimentQuery } from '../../../hooks/useExperimentQuery';
-import { ExperimentViewHeader, ExperimentViewHeaderSkeleton } from './header/ExperimentViewHeader';
-import { ExperimentEntity } from '../../../types';
-import { ExperimentViewDescriptionNotes } from './ExperimentViewDescriptionNotes';
+import type { useGetExperimentQuery } from '../../../hooks/useExperimentQuery';
+import type { ExperimentEntity } from '../../../types';
+import { ExperimentViewMetadataEditor } from './ExperimentViewMetadataEditor';
 import { NOTE_CONTENT_TAG } from '../../../utils/NoteUtils';
-import { ApolloError } from '@mlflow/mlflow/src/common/utils/graphQLHooks';
+import type { ApolloError } from '@mlflow/mlflow/src/common/utils/graphQLHooks';
 import { getGraphQLErrorMessage } from '../../../../graphql/get-graphql-error';
 import { Alert, useDesignSystemTheme } from '@databricks/design-system';
 import { FormattedMessage } from 'react-intl';
+import { ExperimentViewHeader, ExperimentViewHeaderSkeleton } from './header/ExperimentViewHeader';
+import type { ExperimentKind } from '../../../constants';
 
 type GetExperimentReturnType = ReturnType<typeof useGetExperimentQuery>['data'];
 
 /**
- * Renders experiment page header with description and notes editor.
+ * Renders experiment page header with the experiment metadata editor.
  */
 export const ExperimentPageHeaderWithDescription = ({
   experiment,
   loading,
   onNoteUpdated,
   error,
+  experimentKindSelector,
+  savedViewsSlot,
+  inferredExperimentKind,
 }: {
   experiment: GetExperimentReturnType;
   loading?: boolean;
   onNoteUpdated?: () => void;
   error: ApolloError | ReturnType<typeof useGetExperimentQuery>['apiError'];
+  experimentKindSelector?: React.ReactNode;
+  // Forwarded to the header's saved-views slot (see ExperimentViewHeader).
+  savedViewsSlot?: React.ReactNode;
+  inferredExperimentKind?: ExperimentKind;
 }) => {
   const { theme } = useDesignSystemTheme();
-  const [showAddDescriptionButton, setShowAddDescriptionButton] = useState(true);
   const [editing, setEditing] = useState(false);
 
-  // Coerce experiment from the query result into the shape expected by <ExperimentViewHeader />
   const experimentEntity = useMemo(() => {
     const experimentResponse = experiment as GetExperimentReturnType;
     if (!experimentResponse) return null;
@@ -71,12 +77,13 @@ export const ExperimentPageHeaderWithDescription = ({
       <>
         <ExperimentViewHeader
           experiment={experimentEntity}
-          showAddDescriptionButton={showAddDescriptionButton}
+          inferredExperimentKind={inferredExperimentKind}
           setEditing={setEditing}
+          experimentKindSelector={experimentKindSelector}
+          savedViewsSlot={savedViewsSlot}
         />
-        <ExperimentViewDescriptionNotes
+        <ExperimentViewMetadataEditor
           experiment={experimentEntity}
-          setShowAddDescriptionButton={setShowAddDescriptionButton}
           editing={editing}
           setEditing={setEditing}
           onNoteUpdated={onNoteUpdated}

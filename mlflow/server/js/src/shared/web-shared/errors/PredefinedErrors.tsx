@@ -53,7 +53,7 @@ const matchPredefinedApolloError = (error: Error) => {
 const getNetworkRequestErrorDetailsFromResponse = (response: Response): NetworkRequestErrorDetails => {
   const status = response.status;
 
-  return { status };
+  return { status, response };
 };
 
 export const matchPredefinedErrorFromResponse = (response: Response, originalError?: CausableError) => {
@@ -80,14 +80,17 @@ export const matchPredefinedErrorFromResponse = (response: Response, originalErr
 
 interface NetworkRequestErrorDetails {
   status?: number;
+  response?: Response;
 }
 
 export abstract class NetworkRequestError extends PredefinedError {
   status?: number;
+  response?: Response;
 
   constructor(message: string, details: NetworkRequestErrorDetails, cause?: CausableError) {
     super(message, cause);
     this.status = details.status;
+    this.response = details.response;
   }
 
   static getNetworkRequestErrorDetailsFromResponse = getNetworkRequestErrorDetailsFromResponse;
@@ -241,7 +244,7 @@ export class UnauthorizedError extends NetworkRequestError {
   );
 
   constructor(details: NetworkRequestErrorDetails, cause?: CausableError) {
-    const message = 'This request exceeds the maximum queries per second limit. Please wait and try again.';
+    const message = 'User is not authorized.';
 
     super(message, details, cause);
   }

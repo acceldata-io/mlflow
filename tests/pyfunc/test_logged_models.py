@@ -67,14 +67,16 @@ def test_model_id_tracking_thread_safety():
     def predict(idx, model) -> None:
         model.predict([idx])
 
-    with ThreadPoolExecutor(max_workers=len(models)) as executor:
+    with ThreadPoolExecutor(
+        max_workers=len(models), thread_name_prefix="test-logged-models"
+    ) as executor:
         futures = [executor.submit(predict, idx, model) for idx, model in enumerate(models)]
         for f in futures:
             f.result()
 
-    traces = mlflow.search_traces()
+    traces = mlflow.search_traces(return_type="list")
     assert len(traces) == len(models)
-    for trace in mlflow.search_traces()["trace"]:
+    for trace in traces:
         trace_inputs = trace.info.request_metadata["mlflow.traceInputs"]
         index = json.loads(trace_inputs)["model_input"][0]
         model_id = trace.info.request_metadata["mlflow.modelId"]

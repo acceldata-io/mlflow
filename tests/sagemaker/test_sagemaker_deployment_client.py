@@ -2,9 +2,9 @@ import json
 import os
 import re
 import time
-from collections import namedtuple
 from functools import wraps
 from io import BytesIO
+from typing import NamedTuple
 from unittest import mock
 
 import boto3
@@ -35,7 +35,11 @@ from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from tests.helper_functions import set_boto_credentials  # noqa: F401
 from tests.sagemaker.mock import Endpoint, EndpointOperation, mock_sagemaker
 
-TrainedModel = namedtuple("TrainedModel", ["model_path", "run_id", "model_uri"])
+
+class TrainedModel(NamedTuple):
+    model_path: str
+    run_id: str
+    model_uri: str
 
 
 @pytest.fixture
@@ -627,7 +631,7 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
             app_name,
             pretrained_model.model_uri,
             region_name,
-            {**environment_variables, **proxy_variables},
+            environment_variables | proxy_variables,
             config=[f"env={json.dumps(override_environment_variables)}"],
         )
     else:
@@ -641,7 +645,7 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
             app_name,
             pretrained_model.model_uri,
             region_name,
-            {**environment_variables, **proxy_variables},
+            environment_variables | proxy_variables,
             config=[f"env={json.dumps(override_environment_variables)}"],
         )
 
@@ -795,7 +799,7 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
             app_name,
             model_s3_uri,
             region_name,
-            {**environment_variables, **proxy_variables},
+            environment_variables | proxy_variables,
         )
     else:
         proxy_variables = {
@@ -808,7 +812,7 @@ def test_deploy_cli_creates_sagemaker_and_s3_resources_with_expected_names_and_e
             app_name,
             model_s3_uri,
             region_name,
-            {**environment_variables, **proxy_variables},
+            environment_variables | proxy_variables,
         )
 
     region_name = sagemaker_client.meta.region_name
@@ -1376,13 +1380,13 @@ def test_deploy_cli_updates_sagemaker_and_s3_resources_in_replace_mode(
         "MLFLOW_DEPLOYMENT_FLAVOR_NAME": "python_function",
         "SERVING_ENVIRONMENT": "SageMaker",
     }
-    if os.getenv("http_proxy") is not None:
+    if os.environ.get("http_proxy") is not None:
         expected_model_environment.update({"http_proxy": os.environ["http_proxy"]})
 
-    if os.getenv("https_proxy") is not None:
+    if os.environ.get("https_proxy") is not None:
         expected_model_environment.update({"https_proxy": os.environ["https_proxy"]})
 
-    if os.getenv("no_proxy") is not None:
+    if os.environ.get("no_proxy") is not None:
         expected_model_environment.update({"no_proxy": os.environ["no_proxy"]})
 
     assert model_environment == expected_model_environment
@@ -1636,9 +1640,9 @@ def test_predict_with_dataframe_input_output(sagemaker_deployment_client):
 
     def mock_invoke_endpoint(self, operation_name, operation_kwargs):
         if operation_name == "InvokeEndpoint":
-            assert operation_kwargs["Body"] == json.dumps(
-                {"dataframe_split": input_df.to_dict(orient="split")}
-            )
+            assert operation_kwargs["Body"] == json.dumps({
+                "dataframe_split": input_df.to_dict(orient="split")
+            })
             output_json = json.dumps({"predictions": output_df.to_dict(orient="records")})
             result = {"Body": BytesIO(bytes(output_json, encoding="utf-8"))}
         else:

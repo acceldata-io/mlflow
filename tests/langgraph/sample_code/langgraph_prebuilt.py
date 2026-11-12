@@ -1,3 +1,4 @@
+import itertools
 from typing import Literal
 
 from langchain_core.messages import AIMessage, ToolCall
@@ -13,21 +14,22 @@ class FakeOpenAI(ChatOpenAI, extra="allow"):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._responses = iter(
-            [
-                AIMessage(
-                    content="",
-                    tool_calls=[ToolCall(name="get_weather", args={"city": "sf"}, id="123")],
-                    usage_metadata={"input_tokens": 5, "output_tokens": 10, "total_tokens": 15},
-                ),
-                AIMessage(
-                    content="The weather in San Francisco is always sunny!",
-                    usage_metadata={"input_tokens": 10, "output_tokens": 20, "total_tokens": 30},
-                ),
-            ]
-        )
+        self._responses = itertools.cycle([
+            AIMessage(
+                content="",
+                tool_calls=[ToolCall(name="get_weather", args={"city": "sf"}, id="123")],
+                usage_metadata={"input_tokens": 5, "output_tokens": 10, "total_tokens": 15},
+            ),
+            AIMessage(
+                content="The weather in San Francisco is always sunny!",
+                usage_metadata={"input_tokens": 10, "output_tokens": 20, "total_tokens": 30},
+            ),
+        ])
 
     def _generate(self, *args, **kwargs):
+        return ChatResult(generations=[ChatGeneration(message=next(self._responses))])
+
+    async def _agenerate(self, *args, **kwargs):
         return ChatResult(generations=[ChatGeneration(message=next(self._responses))])
 
 

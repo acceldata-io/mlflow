@@ -51,9 +51,7 @@ import mlflow.sklearn
 
 with mlflow.start_run() as run:
     X, y = make_regression(n_features=4, n_informative=2, random_state=0, shuffle=False)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     params = {"max_depth": 2, "random_state": 42}
     model = RandomForestRegressor(**params)
@@ -166,13 +164,10 @@ mlflow server --host 127.0.0.1 --port 8080
 ```
 
 ```
-[2024-02-05 12:43:10 -0500] [26393] [INFO] Starting gunicorn 20.1.0
-[2024-02-05 12:43:10 -0500] [26393] [INFO] Listening at: http://127.0.0.1:8080 (26393)
-[2024-02-05 12:43:10 -0500] [26393] [INFO] Using worker: sync
-[2024-02-05 12:43:10 -0500] [26414] [INFO] Booting worker with pid: 26414
-[2024-02-05 12:43:11 -0500] [26416] [INFO] Booting worker with pid: 26416
-[2024-02-05 12:43:11 -0500] [26428] [INFO] Booting worker with pid: 26428
-[2024-02-05 12:43:11 -0500] [26437] [INFO] Booting worker with pid: 26437
+INFO:     Started server process [26393]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8080 (Press CTRL+C to quit)
 ```
 
 ### Step 3: View the Tracking Server
@@ -279,9 +274,7 @@ client = MlflowClient()
 # Set model version alias
 model_name = "sk-learn-random-forest-reg-model"
 model_version_alias = "the_best_model_ever"
-client.set_registered_model_alias(
-    model_name, model_version_alias, "1"
-)  # Duplicate of step in UI
+client.set_registered_model_alias(model_name, model_version_alias, "1")  # Duplicate of step in UI
 
 # Get information about the model
 model_info = client.get_model_version_by_alias(model_name, model_version_alias)

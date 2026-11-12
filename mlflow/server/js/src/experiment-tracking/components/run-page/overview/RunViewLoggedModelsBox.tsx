@@ -1,6 +1,6 @@
 import { ModelsIcon, Overflow, Typography, useDesignSystemTheme } from '@databricks/design-system';
 import { Link } from '../../../../common/utils/RoutingUtils';
-import { RunInfoEntity } from '../../../types';
+import type { RunInfoEntity } from '../../../types';
 import { type LoggedModelProto } from '../../../types';
 import Routes from '../../../routes';
 import { first } from 'lodash';
@@ -46,11 +46,16 @@ export const RunViewLoggedModelsBox = ({
     return uniqueFlavors.size !== flavors.length;
   }, [loggedModels]);
 
+  if (loggedModels.length === 0 && loggedModelsV3.length === 0) {
+    return <Typography.Hint css={{ padding: `${theme.spacing.xs}px 0px` }}>—</Typography.Hint>;
+  }
+
   return (
     <Overflow>
       {loggedModels.map((model, index) => {
         return (
           <Link
+            componentId="mlflow.run_page.overview.logged_model_link"
             to={Routes.getRunPageRoute(experimentId ?? '', runUuid ?? '', model.artifactPath)}
             key={model.artifactPath}
             css={{
@@ -72,6 +77,7 @@ export const RunViewLoggedModelsBox = ({
       {loggedModelsV3.map((model, index) => {
         return (
           <Link
+            componentId="mlflow.run_page.overview.logged_model_v3_link"
             to={Routes.getExperimentLoggedModelDetailsPageRoute(experimentId ?? '', model.info?.model_id ?? '')}
             key={model.info?.model_id ?? index}
             css={{

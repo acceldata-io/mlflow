@@ -1,6 +1,6 @@
 import hashlib
 import json
-from typing import Any, Optional
+from typing import Any
 
 from mlflow.data.dataset import Dataset
 from mlflow.data.dataset_source import DatasetSource
@@ -20,7 +20,7 @@ class MetaDataset(Dataset):
         name: name of the dataset. If not specified, a name is automatically generated.
         digest: digest (hash, fingerprint) of the dataset. If not specified, a digest is
             automatically computed.
-        schame: schema of the dataset.
+        schema: schema of the dataset.
 
     .. code-block:: python
         :caption: Create a MetaDataset
@@ -47,12 +47,10 @@ class MetaDataset(Dataset):
         source = mlflow.data.http_dataset_source.HTTPDatasetSource(
             url="https://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz"
         )
-        schema = Schema(
-            [
-                ColSpec(type=mlflow.types.DataType.string, name="text"),
-                ColSpec(type=mlflow.types.DataType.integer, name="label"),
-            ]
-        )
+        schema = Schema([
+            ColSpec(type=mlflow.types.DataType.string, name="text"),
+            ColSpec(type=mlflow.types.DataType.integer, name="label"),
+        ])
         ds = mlflow.data.meta_dataset.MetaDataset(source, schema=schema)
 
         with mlflow.start_run() as run:
@@ -62,9 +60,9 @@ class MetaDataset(Dataset):
     def __init__(
         self,
         source: DatasetSource,
-        name: Optional[str] = None,
-        digest: Optional[str] = None,
-        schema: Optional[Schema] = None,
+        name: str | None = None,
+        digest: str | None = None,
+        schema: Schema | None = None,
     ):
         # Set `self._schema` before calling the superclass constructor because
         # `self._compute_digest` depends on `self._schema`.
@@ -87,7 +85,7 @@ class MetaDataset(Dataset):
         return hashlib.sha256(json.dumps(config).encode("utf-8")).hexdigest()[:8]
 
     @property
-    def schema(self) -> Optional[Any]:
+    def schema(self) -> Any | None:
         """Returns the schema of the dataset."""
         return self._schema
 

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import requests
 
@@ -14,8 +14,8 @@ from mlflow.deployments.server.constants import (
 )
 from mlflow.deployments.utils import resolve_endpoint_url
 from mlflow.environment_variables import (
+    MLFLOW_DEPLOYMENT_CLIENT_HTTP_REQUEST_TIMEOUT,
     MLFLOW_DEPLOYMENT_PREDICT_TIMEOUT,
-    MLFLOW_HTTP_REQUEST_TIMEOUT,
 )
 from mlflow.protos.databricks_pb2 import BAD_REQUEST
 from mlflow.store.entities.paged_list import PagedList
@@ -117,8 +117,8 @@ class MlflowDeploymentClient(BaseDeploymentClient):
         self,
         method: str,
         route: str,
-        json_body: Optional[str] = None,
-        timeout: Optional[int] = None,
+        json_body: str | None = None,
+        timeout: int | None = None,
     ):
         call_kwargs = {}
         if method.lower() == "get":
@@ -130,7 +130,9 @@ class MlflowDeploymentClient(BaseDeploymentClient):
             host_creds=get_default_host_creds(self.target_uri),
             endpoint=route,
             method=method,
-            timeout=MLFLOW_HTTP_REQUEST_TIMEOUT.get() if timeout is None else timeout,
+            timeout=MLFLOW_DEPLOYMENT_CLIENT_HTTP_REQUEST_TIMEOUT.get()
+            if timeout is None
+            else timeout,
             retry_codes=MLFLOW_DEPLOYMENT_CLIENT_REQUEST_RETRY_CODES,
             raise_on_status=False,
             **call_kwargs,
@@ -168,12 +170,10 @@ class MlflowDeploymentClient(BaseDeploymentClient):
 
         route = join_paths(MLFLOW_DEPLOYMENTS_CRUD_ENDPOINT_BASE, endpoint)
         response = self._call_endpoint("GET", route)
-        return Endpoint(
-            **{
-                **response,
-                "endpoint_url": resolve_endpoint_url(self.target_uri, response["endpoint_url"]),
-            }
-        )
+        return Endpoint(**{
+            **response,
+            "endpoint_url": resolve_endpoint_url(self.target_uri, response["endpoint_url"]),
+        })
 
     def _list_endpoints(self, page_token=None) -> "PagedList[Endpoint]":
         # Delayed import to avoid importing mlflow.gateway in the module scope
@@ -184,15 +184,13 @@ class MlflowDeploymentClient(BaseDeploymentClient):
             "GET", MLFLOW_DEPLOYMENTS_CRUD_ENDPOINT_BASE, json_body=params
         )
         routes = [
-            Endpoint(
-                **{
-                    **resp,
-                    "endpoint_url": resolve_endpoint_url(
-                        self.target_uri,
-                        resp["endpoint_url"],
-                    ),
-                }
-            )
+            Endpoint(**{
+                **resp,
+                "endpoint_url": resolve_endpoint_url(
+                    self.target_uri,
+                    resp["endpoint_url"],
+                ),
+            })
             for resp in response_json.get("endpoints", [])
         ]
         next_page_token = response_json.get("next_page_token")

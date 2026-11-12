@@ -15,9 +15,10 @@ Prophet (native) format
 import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 import yaml
+from packaging.version import Version
 
 import mlflow
 from mlflow import pyfunc
@@ -42,6 +43,7 @@ from mlflow.utils.environment import (
 from mlflow.utils.file_utils import get_total_file_size, write_to
 from mlflow.utils.model_utils import (
     _add_code_from_conf_to_system_path,
+    _copy_extra_files,
     _get_flavor_configuration,
     _validate_and_copy_code_paths,
     _validate_and_prepare_target_save_path,
@@ -67,7 +69,21 @@ def get_default_pip_requirements():
     # to setup.py installation process.
     # If a pystan installation error occurs, ensure gcc>=8 is installed in your environment.
     # See: https://gcc.gnu.org/install/
-    return [_get_pinned_requirement("prophet")]
+    import prophet
+
+    pip_deps = [_get_pinned_requirement("prophet")]
+
+    # cmdstanpy>=1.3.0 is not compatible with prophet<=1.2.0
+    # https://github.com/facebook/prophet/issues/2697
+    if Version(prophet.__version__) <= Version("1.2.0"):
+        pip_deps.append("cmdstanpy<1.3.0")
+
+    # `Prophet.fit` raises "cannot reindex on an axis with duplicate labels" under pandas 3, and
+    # these versions do not declare the bound themselves (1.2.2 does, and 1.3.0 supports pandas 3)
+    if Version(prophet.__version__) < Version("1.2.2"):
+        pip_deps.append("pandas<3")
+
+    return pip_deps
 
 
 def get_default_conda_env():
@@ -91,6 +107,7 @@ def save_model(
     pip_requirements=None,
     extra_pip_requirements=None,
     metadata=None,
+    extra_files=None,
 ):
     """
     Save a Prophet model to a path on the local file system.
@@ -125,6 +142,7 @@ def save_model(
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
         metadata: {{ metadata }}
+        extra_files: {{ extra_files }}
     """
     import prophet
 
@@ -161,9 +179,12 @@ def save_model(
         code=code_dir_subpath,
         **model_bin_kwargs,
     )
+    extra_files_config = _copy_extra_files(extra_files, path)
+
     flavor_conf = {
         _MODEL_TYPE_KEY: pr_model.__class__.__name__,
         **model_bin_kwargs,
+        **extra_files_config,
     }
     mlflow_model.add_flavor(
         FLAVOR_NAME,
@@ -182,7 +203,7 @@ def save_model(
             # as the package installation of pystan requires Cython to be present
             # in the path. Prophet's installation itself requires imports of
             # existing libraries, preventing the execution of a batched pip install
-            # and instead using a a strictly defined list of dependencies.
+            # and instead using a strictly defined list of dependencies.
             # NOTE: if Prophet .whl build architecture is changed, this should be
             # modified to a standard inferred approach.
             default_reqs = get_default_pip_requirements()
@@ -208,7 +229,7 @@ def save_model(
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
 def log_model(
     pr_model,
-    artifact_path: Optional[str] = None,
+    artifact_path: str | None = None,
     conda_env=None,
     code_paths=None,
     registered_model_name=None,
@@ -218,12 +239,14 @@ def log_model(
     pip_requirements=None,
     extra_pip_requirements=None,
     metadata=None,
-    name: Optional[str] = None,
-    params: Optional[dict[str, Any]] = None,
-    tags: Optional[dict[str, Any]] = None,
-    model_type: Optional[str] = None,
+    extra_files=None,
+    name: str | None = None,
+    params: dict[str, Any] | None = None,
+    tags: dict[str, Any] | None = None,
+    model_type: str | None = None,
     step: int = 0,
-    model_id: Optional[str] = None,
+    model_id: str | None = None,
+    **kwargs,
 ):
     """
     Logs a Prophet model as an MLflow artifact for the current run.
@@ -233,8 +256,7 @@ def log_model(
         artifact_path: Deprecated. Use `name` instead.
         conda_env: {{ conda_env }}
         code_paths: {{ code_paths }}
-        registered_model_name: This argument may change or be removed in a
-            future release without warning. If given, create a model
+        registered_model_name: If given, create a model
             version under ``registered_model_name``, also creating a
             registered model if one with the given name does not exist.
         signature: An instance of the :py:class:`ModelSignature <mlflow.models.ModelSignature>`
@@ -265,12 +287,14 @@ def log_model(
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
         metadata: {{ metadata }}
+        extra_files: {{ extra_files }}
         name: {{ name }}
         params: {{ params }}
         tags: {{ tags }}
         model_type: {{ model_type }}
         step: {{ step }}
         model_id: {{ model_id }}
+        kwargs: Extra arguments to pass to :py:func:`mlflow.models.Model.log`.
 
     Returns:
         A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
@@ -290,11 +314,13 @@ def log_model(
         pip_requirements=pip_requirements,
         extra_pip_requirements=extra_pip_requirements,
         metadata=metadata,
+        extra_files=extra_files,
         params=params,
         tags=tags,
         model_type=model_type,
         step=step,
         model_id=model_id,
+        **kwargs,
     )
 
 
@@ -366,7 +392,7 @@ class _ProphetModelWrapper:
         """
         return self.pr_model
 
-    def predict(self, dataframe, params: Optional[dict[str, Any]] = None):
+    def predict(self, dataframe, params: dict[str, Any] | None = None):
         """
         Args:
             dataframe: Model input data.

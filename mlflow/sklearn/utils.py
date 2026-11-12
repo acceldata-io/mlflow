@@ -1,4 +1,3 @@
-import collections
 import inspect
 import logging
 import pkgutil
@@ -8,6 +7,7 @@ from copy import deepcopy
 from importlib import import_module
 from numbers import Number
 from operator import itemgetter
+from typing import Any, Callable, NamedTuple
 
 import numpy as np
 from packaging.version import Version
@@ -28,15 +28,22 @@ _TRAINING_PREFIX = "training_"
 
 _SAMPLE_WEIGHT = "sample_weight"
 
+
 # _SklearnArtifact represents a artifact (e.g confusion matrix) that will be computed and
 # logged during the autologging routine for a particular model type (eg, classifier, regressor).
-_SklearnArtifact = collections.namedtuple(
-    "_SklearnArtifact", ["name", "function", "arguments", "title"]
-)
+class _SklearnArtifact(NamedTuple):
+    name: str
+    function: Callable[..., Any]
+    arguments: dict[str, Any]
+    title: str
+
 
 # _SklearnMetric represents a metric (e.g, precision_score) that will be computed and
 # logged during the autologging routine for a particular model type (eg, classifier, regressor).
-_SklearnMetric = collections.namedtuple("_SklearnMetric", ["name", "function", "arguments"])
+class _SklearnMetric(NamedTuple):
+    name: str
+    function: Callable[..., Any]
+    arguments: dict[str, Any]
 
 
 def _gen_xgboost_sklearn_estimators_to_patch():
@@ -160,7 +167,7 @@ def _get_metrics_value_dict(metrics_list):
     return metric_value_dict
 
 
-def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight, pos_label):  # noqa: D417
+def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight, pos_label):
     """
     Compute and record various common metrics for classifiers
 
@@ -196,8 +203,6 @@ def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight, 
 
     Args:
         fitted_estimator: The already fitted classifier
-        fit_args: Positional arguments given to fit_func.
-        fit_kwargs: Keyword arguments given to fit_func.
 
     Returns:
         dictionary of (function name, computed value)
@@ -255,19 +260,17 @@ def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight, 
 
     if hasattr(fitted_estimator, "predict_proba"):
         y_pred_proba = fitted_estimator.predict_proba(X)
-        classifier_metrics.extend(
-            [
-                _SklearnMetric(
-                    name=prefix + "log_loss",
-                    function=sklearn.metrics.log_loss,
-                    arguments={
-                        "y_true": y_true,
-                        "y_pred": y_pred_proba,
-                        "sample_weight": sample_weight,
-                    },
-                ),
-            ]
-        )
+        classifier_metrics.extend([
+            _SklearnMetric(
+                name=prefix + "log_loss",
+                function=sklearn.metrics.log_loss,
+                arguments={
+                    "y_true": y_true,
+                    "y_pred": y_pred_proba,
+                    "sample_weight": sample_weight,
+                },
+            ),
+        ])
 
         if _is_metric_supported("roc_auc_score"):
             # For binary case, the parameter `y_score` expect scores must be
@@ -275,21 +278,19 @@ def _get_classifier_metrics(fitted_estimator, prefix, X, y_true, sample_weight, 
             if len(y_pred_proba[0]) == 2:
                 y_pred_proba = y_pred_proba[:, 1]
 
-            classifier_metrics.extend(
-                [
-                    _SklearnMetric(
-                        name=prefix + "roc_auc",
-                        function=sklearn.metrics.roc_auc_score,
-                        arguments={
-                            "y_true": y_true,
-                            "y_score": y_pred_proba,
-                            "average": "weighted",
-                            "sample_weight": sample_weight,
-                            "multi_class": "ovo",
-                        },
-                    ),
-                ]
-            )
+            classifier_metrics.extend([
+                _SklearnMetric(
+                    name=prefix + "roc_auc",
+                    function=sklearn.metrics.roc_auc_score,
+                    arguments={
+                        "y_true": y_true,
+                        "y_score": y_pred_proba,
+                        "average": "weighted",
+                        "sample_weight": sample_weight,
+                        "multi_class": "ovo",
+                    },
+                ),
+            ])
 
     return _get_metrics_value_dict(classifier_metrics)
 
@@ -301,7 +302,7 @@ def _get_class_labels_from_estimator(estimator):
     return estimator.classes_ if hasattr(estimator, "classes_") else None
 
 
-def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight):  # noqa: D417
+def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight):
     """
     Draw and record various common artifacts for classifier
 
@@ -324,8 +325,6 @@ def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight
 
     Args:
         fitted_estimator: The already fitted regressor
-        fit_args: Positional arguments given to fit_func.
-        fit_kwargs: Keyword arguments given to fit_func.
 
     Returns:
         List of artifacts to be logged
@@ -345,13 +344,11 @@ def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight
         if class_labels is None:
             class_labels = set(y_true)
 
-        with matplotlib.rc_context(
-            {
-                "font.size": min(8.0, 50.0 / len(class_labels)),
-                "axes.labelsize": 8.0,
-                "figure.dpi": 175,
-            }
-        ):
+        with matplotlib.rc_context({
+            "font.size": min(8.0, 50.0 / len(class_labels)),
+            "axes.labelsize": 8.0,
+            "figure.dpi": 175,
+        }):
             _, ax = plt.subplots(1, 1, figsize=(6.0, 4.0))
             return (
                 sklearn.metrics.ConfusionMatrixDisplay.from_estimator(*args, **kwargs, ax=ax)
@@ -379,41 +376,39 @@ def _get_classifier_artifacts(fitted_estimator, prefix, X, y_true, sample_weight
     # The plot_roc_curve and plot_precision_recall_curve can only be
     # supported for binary classifier
     if len(set(y_true)) == 2:
-        classifier_artifacts.extend(
-            [
-                _SklearnArtifact(
-                    name=prefix + "roc_curve",
-                    function=sklearn.metrics.RocCurveDisplay.from_estimator
-                    if is_plot_function_deprecated
-                    else sklearn.metrics.plot_roc_curve,
-                    arguments={
-                        "estimator": fitted_estimator,
-                        "X": X,
-                        "y": y_true,
-                        "sample_weight": sample_weight,
-                    },
-                    title="ROC curve",
-                ),
-                _SklearnArtifact(
-                    name=prefix + "precision_recall_curve",
-                    function=sklearn.metrics.PrecisionRecallDisplay.from_estimator
-                    if is_plot_function_deprecated
-                    else sklearn.metrics.plot_precision_recall_curve,
-                    arguments={
-                        "estimator": fitted_estimator,
-                        "X": X,
-                        "y": y_true,
-                        "sample_weight": sample_weight,
-                    },
-                    title="Precision recall curve",
-                ),
-            ]
-        )
+        classifier_artifacts.extend([
+            _SklearnArtifact(
+                name=prefix + "roc_curve",
+                function=sklearn.metrics.RocCurveDisplay.from_estimator
+                if is_plot_function_deprecated
+                else sklearn.metrics.plot_roc_curve,
+                arguments={
+                    "estimator": fitted_estimator,
+                    "X": X,
+                    "y": y_true,
+                    "sample_weight": sample_weight,
+                },
+                title="ROC curve",
+            ),
+            _SklearnArtifact(
+                name=prefix + "precision_recall_curve",
+                function=sklearn.metrics.PrecisionRecallDisplay.from_estimator
+                if is_plot_function_deprecated
+                else sklearn.metrics.plot_precision_recall_curve,
+                arguments={
+                    "estimator": fitted_estimator,
+                    "X": X,
+                    "y": y_true,
+                    "sample_weight": sample_weight,
+                },
+                title="Precision recall curve",
+            ),
+        ])
 
     return classifier_artifacts
 
 
-def _get_regressor_metrics(fitted_estimator, prefix, X, y_true, sample_weight):  # noqa: D417
+def _get_regressor_metrics(fitted_estimator, prefix, X, y_true, sample_weight):
     """
     Compute and record various common metrics for regressors
 
@@ -435,8 +430,6 @@ def _get_regressor_metrics(fitted_estimator, prefix, X, y_true, sample_weight): 
 
     Args:
         fitted_estimator: The already fitted regressor
-        fit_args: Positional arguments given to fit_func.
-        fit_kwargs: Keyword arguments given to fit_func.
 
     Returns:
         dictionary of (function name, computed value)
@@ -758,6 +751,8 @@ def _log_parameter_search_results_as_artifact(cv_results_df, run_id):
 
 # Log how many child runs will be created vs omitted based on `max_tuning_runs`.
 def _log_child_runs_info(max_tuning_runs, total_runs):
+    # More runs can be requested than the search produced, and only the available ones are logged
+    max_tuning_runs = min(max_tuning_runs, total_runs)
     rest = total_runs - max_tuning_runs
 
     # Set logging statement for runs to be logged.
@@ -779,7 +774,7 @@ def _log_child_runs_info(max_tuning_runs, total_runs):
     _logger.info("Logging %s, %s will be omitted.", logging_phrase, omitting_phrase)
 
 
-def _create_child_runs_for_parameter_search(  # noqa: D417
+def _create_child_runs_for_parameter_search(
     autologging_client,
     cv_estimator,
     parent_run,
@@ -939,7 +934,7 @@ def _backported_all_estimators(type_filter=None):
     Use this backported `all_estimators` in old versions of sklearn because:
     1. An inferior version of `all_estimators` that old versions of sklearn use for testing,
        might function differently from a newer version.
-    2. This backported `all_estimators` works on old versions of sklearn that don’t even define
+    2. This backported `all_estimators` works on old versions of sklearn that don't even define
        the testing utility variant of `all_estimators`.
 
     ========== original docstring ==========

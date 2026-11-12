@@ -1,4 +1,4 @@
-from typing import Any, Optional, Union
+from typing import Any
 
 import mlflow.protos.service_pb2 as pb2
 from mlflow.entities._mlflow_object import _MlflowObject
@@ -21,14 +21,14 @@ class LoggedModel(_MlflowObject):
         artifact_location: str,
         creation_timestamp: int,
         last_updated_timestamp: int,
-        model_type: Optional[str] = None,
-        source_run_id: Optional[str] = None,
-        status: Union[LoggedModelStatus, int] = LoggedModelStatus.READY,
-        status_message: Optional[str] = None,
-        tags: Optional[Union[list[LoggedModelTag], dict[str, str]]] = None,
-        params: Optional[Union[list[LoggedModelParameter], dict[str, str]]] = None,
-        metrics: Optional[list[Metric]] = None,
-    ):
+        model_type: str | None = None,
+        source_run_id: str | None = None,
+        status: LoggedModelStatus | int = LoggedModelStatus.READY,
+        status_message: str | None = None,
+        tags: list[LoggedModelTag] | dict[str, str] | None = None,
+        params: list[LoggedModelParameter] | dict[str, str] | None = None,
+        metrics: list[Metric] | None = None,
+    ) -> None:
         super().__init__()
         self._experiment_id: str = experiment_id
         self._model_id: str = model_id
@@ -36,12 +36,12 @@ class LoggedModel(_MlflowObject):
         self._artifact_location: str = artifact_location
         self._creation_time: int = creation_timestamp
         self._last_updated_timestamp: int = last_updated_timestamp
-        self._model_type: Optional[str] = model_type
-        self._source_run_id: Optional[str] = source_run_id
+        self._model_type: str | None = model_type
+        self._source_run_id: str | None = source_run_id
         self._status: LoggedModelStatus = (
             status if isinstance(status, LoggedModelStatus) else LoggedModelStatus.from_int(status)
         )
-        self._status_message: Optional[str] = status_message
+        self._status_message: str | None = status_message
         self._tags: dict[str, str] = (
             {tag.key: tag.value for tag in (tags or [])} if isinstance(tags, list) else (tags or {})
         )
@@ -50,7 +50,7 @@ class LoggedModel(_MlflowObject):
             if isinstance(params, list)
             else (params or {})
         )
-        self._metrics: Optional[list[Metric]] = metrics
+        self._metrics: list[Metric] | None = metrics
         self._model_uri = f"models:/{self.model_id}"
 
     def __repr__(self) -> str:
@@ -76,7 +76,7 @@ class LoggedModel(_MlflowObject):
         return self._experiment_id
 
     @experiment_id.setter
-    def experiment_id(self, new_experiment_id: str):
+    def experiment_id(self, new_experiment_id: str) -> None:
         self._experiment_id = new_experiment_id
 
     @property
@@ -85,7 +85,7 @@ class LoggedModel(_MlflowObject):
         return self._model_id
 
     @model_id.setter
-    def model_id(self, new_model_id: str):
+    def model_id(self, new_model_id: str) -> None:
         self._model_id = new_model_id
 
     @property
@@ -94,7 +94,7 @@ class LoggedModel(_MlflowObject):
         return self._name
 
     @name.setter
-    def name(self, new_name: str):
+    def name(self, new_name: str) -> None:
         self._name = new_name
 
     @property
@@ -103,7 +103,7 @@ class LoggedModel(_MlflowObject):
         return self._artifact_location
 
     @artifact_location.setter
-    def artifact_location(self, new_artifact_location: str):
+    def artifact_location(self, new_artifact_location: str) -> None:
         self._artifact_location = new_artifact_location
 
     @property
@@ -119,20 +119,20 @@ class LoggedModel(_MlflowObject):
         return self._last_updated_timestamp
 
     @last_updated_timestamp.setter
-    def last_updated_timestamp(self, updated_timestamp: int):
+    def last_updated_timestamp(self, updated_timestamp: int) -> None:
         self._last_updated_timestamp = updated_timestamp
 
     @property
-    def model_type(self) -> Optional[str]:
+    def model_type(self) -> str | None:
         """String. Type of the model."""
         return self._model_type
 
     @model_type.setter
-    def model_type(self, new_model_type: Optional[str]):
+    def model_type(self, new_model_type: str | None) -> None:
         self._model_type = new_model_type
 
     @property
-    def source_run_id(self) -> Optional[str]:
+    def source_run_id(self) -> str | None:
         """String. MLflow run ID that generated this model."""
         return self._source_run_id
 
@@ -142,11 +142,11 @@ class LoggedModel(_MlflowObject):
         return self._status
 
     @status.setter
-    def status(self, updated_status: str):
+    def status(self, updated_status: LoggedModelStatus) -> None:
         self._status = updated_status
 
     @property
-    def status_message(self) -> Optional[str]:
+    def status_message(self) -> str | None:
         """String. Descriptive message for error status conditions."""
         return self._status_message
 
@@ -161,18 +161,18 @@ class LoggedModel(_MlflowObject):
         return self._params
 
     @property
-    def metrics(self) -> Optional[list[Metric]]:
+    def metrics(self) -> list[Metric] | None:
         """List of metrics associated with this Model."""
         return self._metrics
+
+    @metrics.setter
+    def metrics(self, new_metrics: list[Metric] | None) -> None:
+        self._metrics = new_metrics
 
     @property
     def model_uri(self) -> str:
         """URI of the model."""
         return self._model_uri
-
-    @metrics.setter
-    def metrics(self, new_metrics: Optional[list[Metric]]):
-        self._metrics = new_metrics
 
     @classmethod
     def _properties(cls) -> list[str]:
@@ -189,7 +189,7 @@ class LoggedModel(_MlflowObject):
         del model_dict["model_uri"]
         return model_dict
 
-    def to_proto(self):
+    def to_proto(self) -> pb2.LoggedModel:
         return pb2.LoggedModel(
             info=pb2.LoggedModelInfo(
                 experiment_id=self.experiment_id,
@@ -210,7 +210,7 @@ class LoggedModel(_MlflowObject):
         )
 
     @classmethod
-    def from_proto(cls, proto):
+    def from_proto(cls, proto: pb2.LoggedModel) -> "LoggedModel":
         return cls(
             experiment_id=proto.info.experiment_id,
             model_id=proto.info.model_id,

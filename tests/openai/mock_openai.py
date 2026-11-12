@@ -1,15 +1,17 @@
 import argparse
+import base64
 import json
-from typing import Any, Optional, Union
+from typing import Any
 
 import fastapi
 from pydantic import BaseModel
 from starlette.responses import StreamingResponse
 
 from mlflow.types.chat import ChatCompletionRequest
-from mlflow.utils import IS_PYDANTIC_V2_OR_NEWER
 
 EMPTY_CHOICES = "EMPTY_CHOICES"
+LIST_CONTENT = "LIST_CONTENT"
+AZURE_ANNOTATIONS = "AZURE_ANNOTATIONS"
 
 app = fastapi.FastAPI()
 
@@ -20,10 +22,7 @@ def health():
 
 
 def chat_response(payload: ChatCompletionRequest):
-    if IS_PYDANTIC_V2_OR_NEWER:
-        dumped_input = json.dumps([m.model_dump(exclude_unset=True) for m in payload.messages])
-    else:
-        dumped_input = json.dumps([m.dict(exclude_unset=True) for m in payload.messages])
+    dumped_input = json.dumps([m.model_dump(exclude_unset=True) for m in payload.messages])
     return {
         "id": "chatcmpl-123",
         "object": "chat.completion",
@@ -91,6 +90,65 @@ def _make_chat_stream_chunk_empty_choices():
     }
 
 
+def _make_chat_stream_annotation_chunk():
+    return {
+        "id": "",
+        "object": "",
+        "created": 0,
+        "model": "",
+        "system_fingerprint": None,
+        "choices": [],
+        "usage": None,
+    }
+
+
+def _make_chat_stream_usage_chunk():
+    return {
+        "id": "chatcmpl-123",
+        "object": "chat.completion.chunk",
+        "created": 1677652288,
+        "model": "gpt-4o-mini",
+        "system_fingerprint": "fp_44709d6fcb",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 9,
+            "completion_tokens": 12,
+            "total_tokens": 21,
+        },
+    }
+
+
+def _make_chat_stream_chunk_with_list_content(content_list, include_usage: bool = False):
+    # Create a streaming chunk with list content (Databricks format).
+    return {
+        "id": "chatcmpl-123",
+        "object": "chat.completion.chunk",
+        "created": 1677652288,
+        "model": "gpt-4o-mini",
+        "system_fingerprint": "fp_44709d6fcb",
+        "choices": [
+            {
+                "delta": {
+                    "content": content_list,
+                    "function_call": None,
+                    "role": None,
+                    "tool_calls": None,
+                },
+                "finish_reason": None,
+                "index": 0,
+                "logprobs": None,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 9,
+            "completion_tokens": 12,
+            "total_tokens": 21,
+        }
+        if include_usage
+        else None,
+    }
+
+
 async def chat_response_stream(include_usage: bool = False):
     # OpenAI Chat Completion stream only includes usage in the last chunk
     # if {"stream_options": {"include_usage": True}} is specified in the request.
@@ -103,6 +161,25 @@ async def chat_response_stream_empty_choices():
     yield _make_chat_stream_chunk("Hello")
 
 
+async def chat_response_stream_with_azure_annotations(include_usage: bool = False):
+    yield _make_chat_stream_annotation_chunk()
+    yield _make_chat_stream_chunk("Hello")
+    yield _make_chat_stream_chunk(" world")
+    if include_usage:
+        yield _make_chat_stream_usage_chunk()
+    yield _make_chat_stream_annotation_chunk()
+
+
+async def chat_response_stream_with_list_content(include_usage: bool = False):
+    # Simulate Databricks streaming format with list content.
+    yield _make_chat_stream_chunk_with_list_content(
+        [{"type": "text", "text": "Hello"}], include_usage=False
+    )
+    yield _make_chat_stream_chunk_with_list_content(
+        [{"type": "text", "text": " world"}], include_usage=include_usage
+    )
+
+
 @app.post("/chat/completions", response_model_exclude_unset=True)
 async def chat(payload: ChatCompletionRequest):
     if payload.stream:
@@ -110,6 +187,20 @@ async def chat(payload: ChatCompletionRequest):
         if EMPTY_CHOICES == payload.messages[0].content:
             content = (
                 f"data: {json.dumps(d)}\n\n" async for d in chat_response_stream_empty_choices()
+            )
+        elif AZURE_ANNOTATIONS == payload.messages[0].content:
+            content = (
+                f"data: {json.dumps(d)}\n\n"
+                async for d in chat_response_stream_with_azure_annotations(
+                    include_usage=(payload.stream_options or {}).get("include_usage", False)
+                )
+            )
+        elif LIST_CONTENT == payload.messages[0].content:
+            content = (
+                f"data: {json.dumps(d)}\n\n"
+                async for d in chat_response_stream_with_list_content(
+                    include_usage=(payload.stream_options or {}).get("include_usage", False)
+                )
             )
         else:
             content = (
@@ -136,7 +227,7 @@ def _make_responses_payload(outputs, tools=None):
         "error": None,
         "incomplete_details": None,
         "max_output_tokens": None,
-        "model": "gpt-4o",
+        "model": "gpt-4o-mini",
         "output": outputs,
         "parallel_tool_calls": True,
         "previous_response_id": None,
@@ -291,7 +382,7 @@ _DUMMY_RESPONSES_STREAM_EVENTS = [
 
 class ResponsesPayload(BaseModel):
     input: Any
-    tools: Optional[list[Any]] = None
+    tools: list[Any] | None = None
     stream: bool = False
 
 
@@ -323,7 +414,7 @@ async def responses(payload: ResponsesPayload):
 
 
 class CompletionsPayload(BaseModel):
-    prompt: Union[str, list[str]]
+    prompt: str | list[str]
     stream: bool = False
 
 
@@ -400,7 +491,7 @@ def completions(payload: CompletionsPayload):
 
 
 class EmbeddingsPayload(BaseModel):
-    input: Union[str, list[str]]
+    input: str | list[str]
 
 
 @app.post("/embeddings")
@@ -417,6 +508,21 @@ def embeddings(payload: EmbeddingsPayload):
         ],
         "model": "text-embedding-ada-002",
         "usage": {"prompt_tokens": 8, "total_tokens": 8},
+    }
+
+
+@app.post("/images/generations")
+def images_generate():
+    # Return a minimal DALL-E-style response with a tiny PNG
+    png_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01").decode()
+    return {
+        "created": 1677652288,
+        "data": [
+            {
+                "b64_json": png_b64,
+                "revised_prompt": "a test image",
+            }
+        ],
     }
 
 

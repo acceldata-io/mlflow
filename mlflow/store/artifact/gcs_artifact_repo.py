@@ -1,9 +1,8 @@
 import datetime
-import importlib.metadata
 import os
 import posixpath
 import urllib.parse
-from collections import namedtuple
+from typing import Any, NamedTuple
 
 from packaging.version import Version
 
@@ -21,11 +20,18 @@ from mlflow.exceptions import _UnsupportedMultipartUploadException
 from mlflow.store.artifact.artifact_repo import (
     ArtifactRepository,
     MultipartUploadMixin,
+    _is_object_key_within_path,
     _retry_with_new_creds,
 )
+from mlflow.utils import get_installed_version
 from mlflow.utils.file_utils import relative_path_to_artifact_path
 
-GCSMPUArguments = namedtuple("GCSMPUArguments", ["transport", "url", "headers", "content_type"])
+
+class GCSMPUArguments(NamedTuple):
+    transport: Any
+    url: str
+    headers: dict[str, str]
+    content_type: str
 
 
 class GCSArtifactRepository(ArtifactRepository, MultipartUploadMixin):
@@ -39,8 +45,15 @@ class GCSArtifactRepository(ArtifactRepository, MultipartUploadMixin):
             credentials as described in https://google-cloud.readthedocs.io/en/latest/core/auth.html
     """
 
-    def __init__(self, artifact_uri, client=None, credential_refresh_def=None):
-        super().__init__(artifact_uri)
+    def __init__(
+        self,
+        artifact_uri: str,
+        client=None,
+        credential_refresh_def=None,
+        tracking_uri: str | None = None,
+        registry_uri: str | None = None,
+    ) -> None:
+        super().__init__(artifact_uri, tracking_uri, registry_uri)
         from google.auth.exceptions import DefaultCredentialsError
         from google.cloud import storage as gcs_storage
         from google.cloud.storage.constants import _DEFAULT_TIMEOUT
@@ -73,8 +86,7 @@ class GCSArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         if parsed.scheme != "gs":
             raise Exception(f"Not a GCS URI: {uri}")
         path = parsed.path
-        if path.startswith("/"):
-            path = path[1:]
+        path = path.removeprefix("/")
         return parsed.netloc, path
 
     def _get_bucket(self, bucket):
@@ -178,13 +190,19 @@ class GCSArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         gcs_bucket = self._get_bucket(bucket_name)
         blobs = gcs_bucket.list_blobs(prefix=f"{dest_path}")
         for blob in blobs:
-            blob.delete()
+            if _is_object_key_within_path(blob.name, dest_path):
+                blob.delete()
 
     @staticmethod
     def _validate_support_mpu():
-        if Version(importlib.metadata.version("google-cloud-storage")) < Version(
-            "2.12.0"
-        ) or Version(importlib.metadata.version("google-resumable-media")) < Version("2.6.0"):
+        gcs_version = get_installed_version("google-cloud-storage")
+        media_version = get_installed_version("google-resumable-media")
+        if (
+            gcs_version is None
+            or gcs_version < Version("2.12.0")
+            or media_version is None
+            or media_version < Version("2.6.0")
+        ):
             raise _UnsupportedMultipartUploadException()
 
     @staticmethod

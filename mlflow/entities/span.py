@@ -1,31 +1,49 @@
+import ast
 import base64
 import json
 import logging
-from functools import lru_cache
-from typing import Any, Optional, Union
+from functools import cached_property
+from typing import Any, Union
 
-from google.protobuf.json_format import MessageToDict, ParseDict
-from google.protobuf.struct_pb2 import Value
+from opentelemetry.proto.resource.v1.resource_pb2 import Resource as OTelProtoResource
+from opentelemetry.proto.trace.v1.trace_pb2 import Span as OTelProtoSpan
+from opentelemetry.proto.trace.v1.trace_pb2 import Status as OTelProtoStatus
 from opentelemetry.sdk.resources import Resource as _OTelResource
 from opentelemetry.sdk.trace import Event as OTelEvent
 from opentelemetry.sdk.trace import ReadableSpan as OTelReadableSpan
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 from opentelemetry.trace import Span as OTelSpan
+from opentelemetry.trace import Status as OTelStatus
+from opentelemetry.trace import StatusCode as OTelStatusCode
 
 import mlflow
+from mlflow.entities.link import Link
 from mlflow.entities.span_event import SpanEvent
+from mlflow.entities.span_log_level import SpanLogLevel
 from mlflow.entities.span_status import SpanStatus, SpanStatusCode
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
-from mlflow.protos.databricks_trace_server_pb2 import Span as ProtoSpan
-from mlflow.tracing.constant import SpanAttributeKey
+from mlflow.tracing.attachments import Attachment
+from mlflow.tracing.constant import TRACE_ID_V4_PREFIX, TRACE_REQUEST_ID_PREFIX, SpanAttributeKey
 from mlflow.tracing.utils import (
-    TraceJSONEncoder,
     build_otel_context,
     decode_id,
+    dump_span_attribute_value,
     encode_span_id,
     encode_trace_id,
+    generate_mlflow_trace_id_from_otel_trace_id,
+    generate_trace_id_v4_from_otel_trace_id,
+    parse_trace_id_v4,
+    set_span_cost_attribute,
+    should_compute_cost_client_side,
 )
+from mlflow.tracing.utils.default_log_level import default_log_level_for_span_type
+from mlflow.tracing.utils.otlp import (
+    _decode_otel_proto_anyvalue,
+    _otel_proto_bytes_to_id,
+    _set_otel_proto_anyvalue,
+)
+from mlflow.tracing.utils.processor import apply_span_processors
 
 _logger = logging.getLogger(__name__)
 
@@ -45,11 +63,16 @@ class SpanType:
     PARSER = "PARSER"
     EMBEDDING = "EMBEDDING"
     RERANKER = "RERANKER"
+    MEMORY = "MEMORY"
     UNKNOWN = "UNKNOWN"
+    WORKFLOW = "WORKFLOW"
+    TASK = "TASK"
+    GUARDRAIL = "GUARDRAIL"
+    EVALUATOR = "EVALUATOR"
 
 
 def create_mlflow_span(
-    otel_span: Any, trace_id: str, span_type: Optional[str] = None
+    otel_span: Any, trace_id: str, span_type: str | None = None
 ) -> Union["Span", "LiveSpan", "NoOpSpan"]:
     """
     Factory function to create a span object.
@@ -95,9 +118,29 @@ class Span:
         # Since the span is immutable, we can cache the attributes to avoid the redundant
         # deserialization of the attribute values.
         self._attributes = _CachedSpanAttributesRegistry(otel_span)
+        self._attachments: dict[str, Attachment] = {}
+        request_id = self._attributes.get(SpanAttributeKey.REQUEST_ID)
+        otel_links = getattr(otel_span, "links", ())
+        if request_id and request_id.startswith(TRACE_ID_V4_PREFIX):
+            if otel_links:
+                _logger.warning(
+                    "Span links are not currently supported for Unity Catalog traces. "
+                    "%d link(s) on span '%s' will be dropped.",
+                    len(otel_links),
+                    otel_span.name,
+                )
+            self._links: list["Link"] = []
+        else:
+            self._links: list["Link"] = [
+                Link(
+                    trace_id=f"tr-{otel_link.context.trace_id:032x}",
+                    span_id=f"{otel_link.context.span_id:016x}",
+                    attributes=dict(otel_link.attributes) if otel_link.attributes else None,
+                )
+                for otel_link in otel_links
+            ]
 
-    @property
-    @lru_cache(maxsize=1)
+    @cached_property
     def trace_id(self) -> str:
         """The trace ID of the span, a unique identifier for the trace it belongs to."""
         return self.get_attribute(SpanAttributeKey.REQUEST_ID)
@@ -123,12 +166,12 @@ class Span:
         return self._span._start_time
 
     @property
-    def end_time_ns(self) -> Optional[int]:
+    def end_time_ns(self) -> int | None:
         """The end time of the span in nanosecond."""
         return self._span._end_time
 
     @property
-    def parent_id(self) -> Optional[str]:
+    def parent_id(self) -> str | None:
         """The span ID of the parent span."""
         if self._span.parent is None:
             return None
@@ -153,6 +196,40 @@ class Span:
     def span_type(self) -> str:
         """The type of the span."""
         return self.get_attribute(SpanAttributeKey.SPAN_TYPE)
+
+    @property
+    def log_level(self) -> SpanLogLevel | None:
+        """
+        The severity level of the span, or ``None`` if it was not classified.
+
+        Set on a :py:class:`LiveSpan <mlflow.entities.LiveSpan>` via
+        :py:meth:`set_log_level <mlflow.entities.LiveSpan.set_log_level>`,
+        the ``log_level`` argument of :py:func:`mlflow.start_span`,
+        :py:func:`mlflow.start_span_no_context`, or :py:func:`mlflow.trace`,
+        or by an autologging integration on the user's behalf.
+        """
+        raw = self.get_attribute(SpanAttributeKey.LOG_LEVEL)
+        if raw is None:
+            return None
+        return SpanLogLevel(raw)
+
+    @property
+    def model_name(self) -> str | None:
+        """The model name used in the span."""
+        return self.get_attribute(SpanAttributeKey.MODEL)
+
+    @property
+    def llm_cost(self) -> dict[str, float] | None:
+        """The cost information for the span in USD.
+
+        Returns a dictionary with keys:
+        - input_cost: Cost of input tokens
+        - output_cost: Cost of output tokens
+        - total_cost: Total cost (input + output)
+
+        Returns None if cost information is not available.
+        """
+        return self.get_attribute(SpanAttributeKey.LLM_COST)
 
     @property
     def _trace_id(self) -> str:
@@ -191,13 +268,30 @@ class Span:
             for event in self._span.events
         ]
 
+    @property
+    def links(self) -> list["Link"]:
+        """
+        Get all links of the span.
+
+        Returns:
+            A list of all links of the span.
+        """
+        return [
+            Link(
+                trace_id=link.trace_id,
+                span_id=link.span_id,
+                attributes=dict(link.attributes) if link.attributes else None,
+            )
+            for link in self._links
+        ]
+
     def __repr__(self):
         return (
             f"{type(self).__name__}(name={self.name!r}, trace_id={self.trace_id!r}, "
             f"span_id={self.span_id!r}, parent_id={self.parent_id!r})"
         )
 
-    def get_attribute(self, key: str) -> Optional[Any]:
+    def get_attribute(self, key: str) -> Any | None:
         """
         Get a single attribute value from the span.
 
@@ -210,17 +304,37 @@ class Span:
         return self._attributes.get(key)
 
     def to_dict(self) -> dict[str, Any]:
-        d = MessageToDict(
-            self.to_proto(),
-            preserving_proto_field_name=True,
-        )
-        # Casting fields types as MessageToDict convert everything to string
-        d["start_time_unix_nano"] = self.start_time_ns
-        d["end_time_unix_nano"] = self.end_time_ns
-        for i, event in enumerate(d.get("events", [])):
-            event["time_unix_nano"] = self.events[i].timestamp
-            event["attributes"] = self.events[i].attributes
-        return d
+        return {
+            "trace_id": _encode_bytes_to_base64(
+                _encode_trace_id_to_byte(self._span.context.trace_id)
+            ),
+            "span_id": _encode_bytes_to_base64(_encode_span_id_to_byte(self._span.context.span_id)),
+            "parent_span_id": _encode_bytes_to_base64(
+                _encode_span_id_to_byte(self._span.parent.span_id)
+            )
+            if self._span.parent
+            else None,
+            "name": self.name,
+            "start_time_unix_nano": self.start_time_ns,
+            "end_time_unix_nano": self.end_time_ns,
+            "events": [
+                {
+                    "name": event.name,
+                    "time_unix_nano": event.timestamp,
+                    "attributes": event.attributes,
+                }
+                for event in self.events
+            ],
+            "status": {
+                "code": self.status.status_code.to_otel_proto_status_code_name(),
+                "message": self.status.description,
+            },
+            # save the dumped attributes so they can be loaded correctly when deserializing.
+            # Read raw values directly from the OTel span to skip a full json.loads pass
+            # over every attribute that self.attributes would trigger via get_all().
+            "attributes": dict(self._span.attributes),
+            "links": [link.to_dict() for link in self.links],
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Span":
@@ -237,11 +351,32 @@ class Span:
             if Span._is_span_v2_schema(data):
                 return cls.from_dict_v2(data)
 
-            trace_id = _decode_id_from_byte(data["trace_id"])
-            span_id = _decode_id_from_byte(data["span_id"])
-            # Parent ID always exists in proto (empty string) even if the span is a root span.
-            parent_id = (
-                _decode_id_from_byte(data["parent_span_id"]) if data["parent_span_id"] else None
+            if _is_base64_encoded(data["trace_id"]):
+                otel_trace_id = _decode_id_from_byte(data["trace_id"])
+                span_id = _decode_id_from_byte(data["span_id"])
+                # Parent ID always exists in proto (empty string) even if the span is a root span.
+                parent_id = (
+                    _decode_id_from_byte(data["parent_span_id"]) if data["parent_span_id"] else None
+                )
+            else:
+                # In 3.5.0, Span.to_dict keeps trace_id and span_id as the object's properties
+                # format, so we need special handling for it.
+                otel_trace_id = decode_id(
+                    parse_trace_id_v4(data["trace_id"])[1].removeprefix(TRACE_REQUEST_ID_PREFIX)
+                )
+                span_id = decode_id(data["span_id"])
+                parent_id = decode_id(data["parent_span_id"]) if data["parent_span_id"] else None
+
+            status_code_str = data["status"]["code"]
+            try:
+                status_code = SpanStatusCode.from_otel_proto_status_code_name(status_code_str)
+            except MlflowException:
+                # In 3.5.0 Span.to_dict keeps status code as the SpanStatusCode enum value
+                # Fall back to value format (e.g., "OK", "ERROR")
+                status_code = SpanStatusCode(status_code_str)
+            status = SpanStatus(
+                status_code=status_code,
+                description=data["status"].get("message", ""),
             )
 
             end_time_ns = data.get("end_time_unix_nano")
@@ -249,15 +384,12 @@ class Span:
 
             otel_span = OTelReadableSpan(
                 name=data["name"],
-                context=build_otel_context(trace_id, span_id),
-                parent=build_otel_context(trace_id, parent_id) if parent_id else None,
+                context=build_otel_context(otel_trace_id, span_id),
+                parent=build_otel_context(otel_trace_id, parent_id) if parent_id else None,
                 start_time=int(data["start_time_unix_nano"]),
                 end_time=end_time_ns,
                 attributes=data["attributes"],
-                status=SpanStatus(
-                    status_code=SpanStatusCode.from_proto_status_code(data["status"]["code"]),
-                    description=data["status"].get("message"),
-                ).to_otel_status(),
+                status=status.to_otel_status(),
                 # Setting an empty resource explicitly. Otherwise OTel create a new Resource by
                 # Resource.create(), which introduces a significant overhead in some environments.
                 # https://github.com/mlflow/mlflow/issues/15625
@@ -271,7 +403,13 @@ class Span:
                     for event in data.get("events", [])
                 ],
             )
-            return cls(otel_span)
+            span = cls(otel_span)
+
+            # Deserialize links if present
+            if links_data := data.get("links"):
+                span._links = [Link.from_dict(link_dict) for link_dict in links_data]
+
+            return span
         except Exception as e:
             raise MlflowException(
                 "Failed to create a Span object from the given dictionary",
@@ -310,36 +448,171 @@ class Span:
                 for event in data["events"]
             ],
         )
-        return cls(otel_span)
+        span = cls(otel_span)
 
-    def to_proto(self):
-        """Convert into OTLP compatible proto object to sent to the Databricks Trace Server."""
-        otel_status = self._span.status
-        status = ProtoSpan.Status(
-            code=otel_status.status_code.value,
-            message=otel_status.description,
+        span._links = [Link.from_dict(d) for d in data.get("links", [])]
+
+        return span
+
+    @classmethod
+    def from_otel_proto(
+        cls,
+        otel_proto_span: OTelProtoSpan,
+        location_id: str | None = None,
+        *,
+        preserve_request_id: bool = False,
+        resource: OTelProtoResource | None = None,
+    ) -> "Span":
+        """
+        Create a Span from an OpenTelemetry protobuf span.
+
+        This is an internal method used for receiving spans via OTel protocol. By default,
+        MLflow derives the canonical ``mlflow.traceRequestId`` from the OTLP trace ID so server
+        ingest does not trust a client-sent request ID. Set ``preserve_request_id=True`` only for
+        trusted internal round-trip flows, such as archived trace payload deserialization, where
+        the stored MLflow request ID must be preserved exactly if present.
+        """
+        # Validate required fields - empty bytes indicate missing trace_id or span_id
+        if not otel_proto_span.trace_id:
+            raise ValueError("trace_id is required but was empty")
+        if not otel_proto_span.span_id:
+            raise ValueError("span_id is required but was empty")
+
+        trace_id = _otel_proto_bytes_to_id(otel_proto_span.trace_id)
+        span_id = _otel_proto_bytes_to_id(otel_proto_span.span_id)
+        parent_id = None
+        if otel_proto_span.parent_span_id:
+            parent_id = _otel_proto_bytes_to_id(otel_proto_span.parent_span_id)
+
+        # Convert OTel proto status code directly to OTel SDK status
+        if otel_proto_span.status.code == OTelProtoStatus.STATUS_CODE_OK:
+            status_code = OTelStatusCode.OK
+        elif otel_proto_span.status.code == OTelProtoStatus.STATUS_CODE_ERROR:
+            status_code = OTelStatusCode.ERROR
+        else:
+            status_code = OTelStatusCode.UNSET
+
+        serialized_attributes = {
+            attr.key: dump_span_attribute_value(_decode_otel_proto_anyvalue(attr.value))
+            for attr in otel_proto_span.attributes
+        }
+        mlflow_trace_id = (
+            generate_trace_id_v4_from_otel_trace_id(trace_id, location_id)
+            if location_id
+            else generate_mlflow_trace_id_from_otel_trace_id(trace_id)
         )
-        parent = _encode_span_id_to_byte(self._span.parent.span_id) if self._span.parent else b""
 
-        # NB: This is a workaround that some DBX internal code pass float timestamp
-        start_time_unix_nano = int(self._span.start_time) if self._span.start_time else None
-        end_time_unix_nano = int(self._span.end_time) if self._span.end_time else None
+        # Convert proto Resource to OTel SDK Resource if provided.
+        # We avoid _OTelResource.create() which has significant overhead from
+        # environment variable reads (see https://github.com/mlflow/mlflow/issues/15625).
+        if resource is not None and resource.attributes:
+            resource_attrs = {
+                attr.key: _decode_otel_proto_anyvalue(attr.value) for attr in resource.attributes
+            }
+            otel_resource = _OTelResource(resource_attrs)
+        else:
+            otel_resource = _OTelResource.get_empty()
 
-        return ProtoSpan(
-            trace_id=_encode_trace_id_to_byte(self._span.context.trace_id),
-            span_id=_encode_span_id_to_byte(self._span.context.span_id),
-            trace_state=self._span.context.trace_state or "",
-            parent_span_id=parent,
-            name=self.name,
-            start_time_unix_nano=start_time_unix_nano,
-            end_time_unix_nano=end_time_unix_nano,
-            events=[event.to_proto() for event in self.events],
-            status=status,
-            attributes={k: ParseDict(v, Value()) for k, v in self._span.attributes.items()},
+        links = []
+        if location_id:
+            if otel_proto_span.links:
+                _logger.warning(
+                    "Span links are not currently supported for Unity Catalog traces. "
+                    "%d link(s) on span '%s' will be dropped.",
+                    len(otel_proto_span.links),
+                    otel_proto_span.name,
+                )
+        else:
+            links = [Link.from_otel_proto(proto_link) for proto_link in otel_proto_span.links]
+
+        otel_span = OTelReadableSpan(
+            name=otel_proto_span.name,
+            context=build_otel_context(trace_id, span_id),
+            parent=build_otel_context(trace_id, parent_id) if parent_id else None,
+            start_time=otel_proto_span.start_time_unix_nano,
+            end_time=otel_proto_span.end_time_unix_nano,
+            # we need to dump the attribute value to be consistent with span.set_attribute behavior
+            attributes={
+                **serialized_attributes,
+                SpanAttributeKey.REQUEST_ID: (
+                    serialized_attributes.get(
+                        SpanAttributeKey.REQUEST_ID, dump_span_attribute_value(mlflow_trace_id)
+                    )
+                    if preserve_request_id
+                    else dump_span_attribute_value(mlflow_trace_id)
+                ),
+            },
+            status=OTelStatus(status_code, otel_proto_span.status.message or None),
+            events=[
+                OTelEvent(
+                    name=event.name,
+                    timestamp=event.time_unix_nano,
+                    attributes={
+                        attr.key: _decode_otel_proto_anyvalue(attr.value)
+                        for attr in event.attributes
+                    },
+                )
+                for event in otel_proto_span.events
+            ],
+            resource=otel_resource,
         )
 
+        span = cls(otel_span)
+        span._links = links
+        return span
 
-def _encode_span_id_to_byte(span_id: Optional[int]) -> bytes:
+    def to_otel_proto(self) -> OTelProtoSpan:
+        """
+        Convert to OpenTelemetry protobuf span format for OTLP export.
+        This is an internal method used by the REST store for logging spans.
+
+        Returns:
+            An OpenTelemetry protobuf Span message.
+        """
+        otel_span = OTelProtoSpan()
+        otel_span.trace_id = bytes.fromhex(self._trace_id)
+        otel_span.span_id = bytes.fromhex(self.span_id)
+
+        otel_span.name = self.name
+        otel_span.start_time_unix_nano = self.start_time_ns
+        if self.end_time_ns:
+            otel_span.end_time_unix_nano = self.end_time_ns
+
+        if self.parent_id:
+            otel_span.parent_span_id = bytes.fromhex(self.parent_id)
+
+        otel_span.status.CopyFrom(self.status.to_otel_proto_status())
+
+        for key, value in self.attributes.items():
+            attr = otel_span.attributes.add()
+            attr.key = key
+            _set_otel_proto_anyvalue(attr.value, value)
+
+        for event in self.events:
+            otel_event = event.to_otel_proto()
+            otel_span.events.append(otel_event)
+
+        # Convert links to OTLP proto format
+        for link in self.links:
+            proto_link = otel_span.links.add()
+            # Convert MLflow trace ID (tr-xxx or trace:/loc/xxx) back to OTel bytes
+            link_trace_id_hex = parse_trace_id_v4(link.trace_id)[1].removeprefix(
+                TRACE_REQUEST_ID_PREFIX
+            )
+            proto_link.trace_id = decode_id(link_trace_id_hex).to_bytes(16, "big")
+            proto_link.span_id = decode_id(link.span_id).to_bytes(8, "big")
+
+            # Add link attributes
+            if link.attributes:
+                for key, value in link.attributes.items():
+                    attr = proto_link.attributes.add()
+                    attr.key = key
+                    _set_otel_proto_anyvalue(attr.value, value)
+
+        return otel_span
+
+
+def _encode_span_id_to_byte(span_id: int | None) -> bytes:
     # https://github.com/open-telemetry/opentelemetry-python/blob/e01fa0c77a7be0af77d008a888c2b6a707b05c3d/exporter/opentelemetry-exporter-otlp-proto-common/src/opentelemetry/exporter/otlp/proto/common/_internal/__init__.py#L131
     return span_id.to_bytes(length=8, byteorder="big", signed=False)
 
@@ -349,10 +622,22 @@ def _encode_trace_id_to_byte(trace_id: int) -> bytes:
     return trace_id.to_bytes(length=16, byteorder="big", signed=False)
 
 
+def _encode_bytes_to_base64(bytes: bytes) -> str:
+    return base64.b64encode(bytes).decode("utf-8")
+
+
 def _decode_id_from_byte(trace_or_span_id_b64: str) -> int:
     # Decoding the base64 encoded trace or span ID to bytes and then converting it to int.
     bytes = base64.b64decode(trace_or_span_id_b64)
     return int.from_bytes(bytes, byteorder="big", signed=False)
+
+
+def _is_base64_encoded(trace_or_span_id: str) -> bool:
+    try:
+        base64.b64decode(trace_or_span_id, validate=True)
+        return True
+    except Exception:
+        return False
 
 
 class LiveSpan(Span):
@@ -386,21 +671,295 @@ class LiveSpan(Span):
             )
 
         self._span = otel_span
+        self._attachments: dict[str, Attachment] = {}
         self._attributes = _SpanAttributesRegistry(otel_span)
         self._attributes.set(SpanAttributeKey.REQUEST_ID, trace_id)
         self._attributes.set(SpanAttributeKey.SPAN_TYPE, span_type)
+        otel_links = getattr(otel_span, "links", ())
+        if trace_id.startswith(TRACE_ID_V4_PREFIX):
+            if otel_links:
+                _logger.warning(
+                    "Span links are not currently supported for Unity Catalog traces. "
+                    "%d link(s) on span '%s' will be dropped.",
+                    len(otel_links),
+                    otel_span.name,
+                )
+            self._links: list["Link"] = []
+        else:
+            self._links: list["Link"] = [
+                Link(
+                    trace_id=f"tr-{otel_link.context.trace_id:032x}",
+                    span_id=f"{otel_link.context.span_id:016x}",
+                    attributes=dict(otel_link.attributes) if otel_link.attributes else None,
+                )
+                for otel_link in otel_links
+            ]
+        # Track the original span name for deduplication purposes during span logging.
+        # Why: When traces contain multiple spans with identical names (e.g., multiple "LLM"
+        # or "query" spans), it's difficult for users to distinguish between them in the UI
+        # and logs. As spans are logged, we incrementally add numeric suffixes (_1, _2, etc.) to
+        # make each span uniquely identifiable within its trace
+        self._original_name = otel_span.name
 
     def set_span_type(self, span_type: str):
         """Set the type of the span."""
         self.set_attribute(SpanAttributeKey.SPAN_TYPE, span_type)
 
+    def set_log_level(self, level: SpanLogLevel | str):
+        """
+        Set the severity level of the span.
+
+        Args:
+            level: A :py:class:`SpanLogLevel <mlflow.entities.SpanLogLevel>` or
+                its name (e.g. ``"INFO"``).
+        """
+        normalized = SpanLogLevel.from_value(level)
+        self.set_attribute(SpanAttributeKey.LOG_LEVEL, int(normalized))
+
+    def _is_recording(self) -> bool:
+        return self._span.is_recording()
+
     def set_inputs(self, inputs: Any):
         """Set the input values to the span."""
+        extract_base64 = self._should_extract_base64()
+        inputs = self._extract_attachments(inputs, extract_base64)
         self.set_attribute(SpanAttributeKey.INPUTS, inputs)
+        # Second pass on the serialized form handles framework objects
+        # (e.g., Pydantic models, LangChain BaseMessage) that only become
+        # plain dicts after JSON serialization by set_attribute.
+        if extract_base64:
+            self._extract_attachments_from_serialized(SpanAttributeKey.INPUTS)
 
     def set_outputs(self, outputs: Any):
         """Set the output values to the span."""
+        extract_base64 = self._should_extract_base64()
+        outputs = self._extract_attachments(outputs, extract_base64)
         self.set_attribute(SpanAttributeKey.OUTPUTS, outputs)
+        if extract_base64:
+            self._extract_attachments_from_serialized(SpanAttributeKey.OUTPUTS)
+
+    def _extract_attachments_from_serialized(self, attr_key: str):
+        """Re-extract attachments from the serialized attribute value.
+
+        Handles cases where the first extraction pass couldn't recurse into
+        framework-specific objects (e.g., LangChain BaseMessage) that only
+        become plain dicts after JSON serialization.
+        """
+        serialized = self._attributes.get(attr_key)
+        if serialized is None:
+            return
+        attachments_before = len(self._attachments)
+        extracted = self._extract_attachments(serialized, extract_base64=True)
+        if len(self._attachments) > attachments_before:
+            self.set_attribute(attr_key, extracted)
+
+    def _extract_attachments(self, value: Any, extract_base64: bool) -> Any:
+        if isinstance(value, Attachment):
+            return self._store_attachment(value)
+        if extract_base64:
+            if isinstance(value, str):
+                converted = self._try_convert_data_uri(value)
+                if converted is not None:
+                    return converted
+            if isinstance(value, dict):
+                converted = self._try_convert_structured_content(value)
+                if converted is not None:
+                    # Recurse into the converted dict to catch remaining patterns
+                    # in sibling keys (e.g. a data URI in another field)
+                    if isinstance(converted, dict):
+                        return {
+                            k: self._extract_attachments(v, extract_base64)
+                            for k, v in converted.items()
+                        }
+                    return converted
+        if isinstance(value, dict):
+            return {k: self._extract_attachments(v, extract_base64) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._extract_attachments(item, extract_base64) for item in value]
+        return value
+
+    def _store_attachment(self, attachment: Attachment) -> str:
+        from mlflow.environment_variables import MLFLOW_TRACE_MAX_ATTACHMENT_SIZE
+
+        if not self._is_recording():
+            _logger.debug("Skipping attachment storage because the span is no longer recording.")
+            return attachment.ref(self.trace_id)
+
+        max_size = MLFLOW_TRACE_MAX_ATTACHMENT_SIZE.get()
+        if max_size is not None and max_size > 0 and len(attachment.content_bytes) > max_size:
+            size_bytes = len(attachment.content_bytes)
+            msg = (
+                f"Attachment too large ({size_bytes} bytes > {max_size} bytes limit). "
+                f"Content discarded."
+            )
+            _logger.warning(msg)
+            self.record_exception(msg)
+            return f"[Attachment too large: {size_bytes} bytes exceeds {max_size} bytes limit]"
+        ref = attachment.ref(self.trace_id)
+        self._attachments[attachment.id] = attachment
+        return ref
+
+    @staticmethod
+    def _should_extract_base64() -> bool:
+        from mlflow.environment_variables import MLFLOW_TRACE_EXTRACT_ATTACHMENTS
+
+        return MLFLOW_TRACE_EXTRACT_ATTACHMENTS.get()
+
+    def _try_convert_data_uri(self, value: str) -> str | None:
+        if not value.startswith("data:") or ";base64," not in value:
+            return None
+        header, _, b64data = value.partition(";base64,")
+        mime = header[len("data:") :]
+        if not mime:
+            return None
+        try:
+            content_bytes = base64.b64decode(b64data, validate=True)
+        except Exception:
+            return None
+        return self._store_attachment(Attachment(content_type=mime, content_bytes=content_bytes))
+
+    def _try_convert_structured_content(self, value: dict[str, Any]) -> dict[str, Any] | str | None:
+        # TODO: If this grows unwieldy, consider either (a) splitting into per-provider
+        # helpers (parse_openai_audio, parse_anthropic_image, etc.) or (b) moving
+        # extraction into individual autolog integrations as post-execution hooks.
+        # See: https://github.com/mlflow/mlflow/pull/21955#discussion_r2999432747
+
+        # OpenAI input_audio content part
+        if value.get("type") == "input_audio" and isinstance(
+            audio := value.get("input_audio"), dict
+        ):
+            data = audio.get("data")
+            fmt = audio.get("format", "wav")
+            if isinstance(data, str) and data:
+                try:
+                    content_bytes = base64.b64decode(data, validate=True)
+                except Exception:
+                    return None
+                content_type = "audio/mpeg" if fmt == "mp3" else f"audio/{fmt}"
+                ref = self._store_attachment(
+                    Attachment(content_type=content_type, content_bytes=content_bytes)
+                )
+                return {
+                    **value,
+                    "input_audio": {**audio, "data": ref},
+                }
+
+        # Anthropic image content part
+        if value.get("type") == "image" and isinstance(source := value.get("source"), dict):
+            if source.get("type") == "base64":
+                data = source.get("data")
+                media_type = source.get("media_type", "image/png")
+                if isinstance(data, str) and data:
+                    try:
+                        content_bytes = base64.b64decode(data, validate=True)
+                    except Exception:
+                        return None
+                    ref = self._store_attachment(
+                        Attachment(content_type=media_type, content_bytes=content_bytes)
+                    )
+                    return {
+                        **value,
+                        "source": {**source, "data": ref},
+                    }
+
+        # DALL-E output: {"b64_json": "<base64>", ...}
+        # DALL-E always returns PNG; other APIs using b64_json are not known
+        if isinstance(b64 := value.get("b64_json"), str) and b64:
+            try:
+                content_bytes = base64.b64decode(b64, validate=True)
+            except Exception:
+                return None
+            ref = self._store_attachment(
+                Attachment(content_type="image/png", content_bytes=content_bytes)
+            )
+            return {**value, "b64_json": ref}
+
+        # OpenAI audio output: {"audio": {"data": "<base64>", "transcript": "..."}, ...}
+        # Returned by gpt-4o-audio-preview with modalities=["text", "audio"]
+        if isinstance(audio := value.get("audio"), dict):
+            data = audio.get("data")
+            if isinstance(data, str) and data and not data.startswith("mlflow-attachment://"):
+                try:
+                    content_bytes = base64.b64decode(data, validate=True)
+                except Exception:
+                    return None
+                ref = self._store_attachment(
+                    Attachment(content_type="audio/wav", content_bytes=content_bytes)
+                )
+                return {
+                    **value,
+                    "audio": {**audio, "data": ref},
+                }
+
+        # Bedrock converse API: {"image": {"format": "png", "source": {"bytes": "<base64>"}}}
+        if isinstance(image := value.get("image"), dict):
+            source = image.get("source")
+            if isinstance(source, dict):
+                data = source.get("bytes")
+                fmt = image.get("format", "png")
+                if isinstance(data, str) and data and not data.startswith("mlflow-attachment://"):
+                    if not isinstance(fmt, str) or not fmt:
+                        fmt = "png"
+                    try:
+                        content_bytes = base64.b64decode(data, validate=True)
+                    except Exception:
+                        return None
+                    ref = self._store_attachment(
+                        Attachment(content_type=f"image/{fmt}", content_bytes=content_bytes)
+                    )
+                    return {
+                        **value,
+                        "image": {**image, "source": {**source, "bytes": ref}},
+                    }
+
+        # Google Gemini: {"inline_data": {"mime_type": "image/png", "data": "<base64>"}}
+        # The Gemini SDK (Pydantic) may serialize bytes as a Python repr string
+        # (e.g., "b'\\x89PNG...'") instead of base64, so we handle both formats.
+        if isinstance(inline := value.get("inline_data"), dict):
+            data = inline.get("data")
+            mime_type = inline.get("mime_type", "application/octet-stream")
+            if isinstance(data, str) and data and not data.startswith("mlflow-attachment://"):
+                if not isinstance(mime_type, str) or not mime_type:
+                    mime_type = "application/octet-stream"
+                content_bytes = None
+                if data.startswith(("b'", 'b"')):
+                    try:
+                        parsed = ast.literal_eval(data)
+                        if isinstance(parsed, bytes):
+                            content_bytes = parsed
+                    except Exception:
+                        pass
+                if content_bytes is None:
+                    try:
+                        content_bytes = base64.b64decode(data, validate=True)
+                    except Exception:
+                        return None
+                ref = self._store_attachment(
+                    Attachment(content_type=mime_type, content_bytes=content_bytes)
+                )
+                return {
+                    **value,
+                    "inline_data": {**inline, "data": ref},
+                }
+
+        # OpenAI Responses API image generation:
+        # {"type": "image_generation_call", "result": "<base64>", "output_format": "png"}
+        if value.get("type") == "image_generation_call":
+            data = value.get("result")
+            fmt = value.get("output_format", "png")
+            if isinstance(data, str) and data and not data.startswith("mlflow-attachment://"):
+                if not isinstance(fmt, str) or not fmt:
+                    fmt = "png"
+                try:
+                    content_bytes = base64.b64decode(data, validate=True)
+                except Exception:
+                    return None
+                ref = self._store_attachment(
+                    Attachment(content_type=f"image/{fmt}", content_bytes=content_bytes)
+                )
+                return {**value, "result": ref}
+
+        return None
 
     def set_attributes(self, attributes: dict[str, Any]):
         """
@@ -421,7 +980,7 @@ class LiveSpan(Span):
         """Set a single attribute to the span."""
         self._attributes.set(key, value)
 
-    def set_status(self, status: Union[SpanStatusCode, str]):
+    def set_status(self, status: SpanStatusCode | str):
         """
         Set the status of the span.
 
@@ -454,8 +1013,73 @@ class LiveSpan(Span):
                 :py:class:`SpanEvent <mlflow.entities.SpanEvent>` object.
         """
         self._span.add_event(event.name, event.attributes, event.timestamp)
+        # OTel reserves the event name "exception" for exception events
+        # (`SpanEvent.from_exception`). Bump the span's level so users with the
+        # filter set above DEBUG/INFO still see anything that blew up. Preserve
+        # user-set CRITICAL.
+        if event.name == "exception":
+            current = self._attributes.get(SpanAttributeKey.LOG_LEVEL)
+            if current is None or int(current) < SpanLogLevel.ERROR:
+                self._attributes.set(SpanAttributeKey.LOG_LEVEL, int(SpanLogLevel.ERROR))
 
-    def record_exception(self, exception: Union[str, Exception]):
+    def add_link(self, link: "Link"):
+        """
+        Add a link to this span.
+
+        Args:
+            link: The link to add to the span. This should be a
+                :py:class:`Link <mlflow.entities.Link>` object.
+        """
+        if not self._is_recording():
+            _logger.debug("Skipping link addition because the span is no longer recording.")
+            return
+
+        if not isinstance(link, Link):
+            raise MlflowException(
+                f"The `link` parameter must be a Link instance, but got {type(link)}.",
+                INVALID_PARAMETER_VALUE,
+            )
+
+        # Span links are not supported for Unity Catalog (V4) traces. Warn and skip rather than
+        # silently normalizing the V4 trace ID to raw OTel hex (see #25080); this matches how
+        # V4-trace links are dropped at span construction.
+        if link.trace_id is not None and link.trace_id.startswith(TRACE_ID_V4_PREFIX):
+            _logger.warning(
+                "Span links are not currently supported for Unity Catalog traces. "
+                "The link to trace '%s' will be skipped.",
+                link.trace_id,
+            )
+            return
+
+        # Validate and forward to the underlying OTel span so external exporters can see links
+        try:
+            link_trace_id_hex = parse_trace_id_v4(link.trace_id)[1].removeprefix(
+                TRACE_REQUEST_ID_PREFIX
+            )
+            trace_id_int = decode_id(link_trace_id_hex)
+            span_id_int = decode_id(link.span_id)
+            trace_id_int.to_bytes(16, "big")
+            span_id_int.to_bytes(8, "big")
+            otel_context = build_otel_context(trace_id_int, span_id_int)
+        except (ValueError, OverflowError, AttributeError, MlflowException) as e:
+            raise MlflowException(
+                f"Invalid link: trace_id={link.trace_id!r}, span_id={link.span_id!r}. "
+                "trace_id must be a valid MLflow trace ID or hex string, and "
+                "span_id must be a hex string.",
+                INVALID_PARAMETER_VALUE,
+            ) from e
+
+        self._links.append(
+            Link(
+                trace_id=link.trace_id,
+                span_id=link.span_id,
+                attributes=dict(link.attributes) if link.attributes else None,
+            )
+        )
+        if hasattr(self._span, "add_link"):
+            self._span.add_link(otel_context, link.attributes)
+
+    def record_exception(self, exception: str | Exception):
         """
         Record an exception on the span, adding an exception event and setting span status to ERROR.
 
@@ -473,14 +1097,19 @@ class LiveSpan(Span):
                 INVALID_PARAMETER_VALUE,
             )
 
-        self.set_status(SpanStatusCode.ERROR)
+        self.set_status(
+            SpanStatus(
+                status_code=SpanStatusCode.ERROR,
+                description=f"{type(exception).__name__}: {exception}",
+            )
+        )
 
     def end(
         self,
-        outputs: Optional[Any] = None,
-        attributes: Optional[dict[str, Any]] = None,
-        status: Optional[Union[SpanStatus, str]] = None,
-        end_time_ns: Optional[int] = None,
+        outputs: Any | None = None,
+        attributes: dict[str, Any] | None = None,
+        status: SpanStatus | str | None = None,
+        end_time_ns: int | None = None,
     ):
         """
         End the span.
@@ -513,6 +1142,60 @@ class LiveSpan(Span):
             if self.status.status_code != SpanStatusCode.ERROR:
                 self.set_status(SpanStatus(SpanStatusCode.OK))
 
+            try:
+                # Tracking configuration applies to the whole trace regardless
+                # of this span's type or final status.
+                from mlflow.agent.hint import maybe_warn_local_tracking_for_databricks
+
+                maybe_warn_local_tracking_for_databricks()
+            except Exception:
+                # Agent hints are advisory and must never prevent span finalization.
+                pass
+
+            if self.status.status_code != SpanStatusCode.ERROR and self.span_type in (
+                SpanType.LLM,
+                SpanType.TOOL,
+                SpanType.RETRIEVER,
+            ):
+                try:
+                    # Import lazily: most MLflow users never create GenAI spans, and
+                    # agent hints must not add work to their span lifecycle.
+                    from mlflow.agent.hint import maybe_warn_agent
+
+                    if self.inputs is None:
+                        maybe_warn_agent(
+                            "genai-span-missing-inputs",
+                            f"The successful {self.span_type} span {self.name!r} has no recorded "
+                            "inputs.",
+                        )
+                    if self.outputs is None:
+                        maybe_warn_agent(
+                            "genai-span-missing-outputs",
+                            f"The successful {self.span_type} span {self.name!r} has no recorded "
+                            "outputs.",
+                        )
+                except Exception:
+                    # Agent hints are advisory and must never prevent span finalization.
+                    pass
+
+            if should_compute_cost_client_side():
+                set_span_cost_attribute(self)
+
+            # Resolve the log level from the final span_type if neither
+            # set_log_level nor an exception bump set it during the lifetime.
+            # Done here (rather than in __init__/set_span_type) so the
+            # resolution sees the canonical span_type without re-stamping
+            # logic, and so manual `start_span` and autolog flows behave
+            # identically.
+            if self._attributes.get(SpanAttributeKey.LOG_LEVEL) is None:
+                self._attributes.set(
+                    SpanAttributeKey.LOG_LEVEL,
+                    int(default_log_level_for_span_type(self.span_type)),
+                )
+
+            # Apply span processors
+            apply_span_processors(self)
+
             self._span.end(end_time=end_time_ns)
 
         except Exception as e:
@@ -532,16 +1215,27 @@ class LiveSpan(Span):
         :meta private:
         """
         # All state of the live span is already persisted in the OpenTelemetry span object.
-        return Span(self._span)
+        span = Span(self._span)
+        # Shallow copies so the immutable span is independent of further LiveSpan mutations
+        span._attachments = dict(self._attachments)
+        span._links = [
+            Link(
+                trace_id=link.trace_id,
+                span_id=link.span_id,
+                attributes=dict(link.attributes) if link.attributes else None,
+            )
+            for link in self._links
+        ]
+        return span
 
     @classmethod
     def from_immutable_span(
         cls,
         span: Span,
-        parent_span_id: Optional[str] = None,
-        trace_id: Optional[str] = None,
-        otel_trace_id: Optional[str] = None,
-        end_trace: bool = True,
+        parent_span_id: str | None = None,
+        trace_id: str | None = None,
+        experiment_id: str | None = None,
+        otel_trace_id: str | None = None,
     ) -> "LiveSpan":
         """
         Create a new LiveSpan object from the given immutable span by
@@ -558,9 +1252,10 @@ class LiveSpan(Span):
                 If it is None, the span will be created as a root span.
             trace_id: The trace ID to be set on the new span. Specify this if you want to
                 create the new span with a particular trace ID.
+            experiment_id: The experiment ID to be set on the new span. If not specified, the
+                experiment ID will be set to the current experiment ID.
             otel_trace_id: The OpenTelemetry trace ID of the new span in hex encoded format.
                 If not specified, the newly generated trace ID will be used.
-            end_trace: Whether to end the trace after cloning the span. Default is True.
 
         Returns:
             The new LiveSpan object with the same state as the original span.
@@ -577,20 +1272,33 @@ class LiveSpan(Span):
             name=span.name,
             parent=parent_span._span if parent_span else None,
             start_time_ns=span.start_time_ns,
+            experiment_id=experiment_id,
         )
+
         # The latter one from attributes is the newly generated trace ID by the span processor.
         trace_id = trace_id or json.loads(otel_span.attributes.get(SpanAttributeKey.REQUEST_ID))
-        clone_span = LiveSpan(otel_span, trace_id, span.span_type)
+        # Span processor registers a new span in the in-memory trace manager, but we want to pop it
+        clone_span = trace_manager._traces[trace_id].span_dict.pop(
+            encode_span_id(otel_span.context.span_id)
+        )
 
         # Copy all the attributes, inputs, outputs, and events from the original span
         clone_span.set_status(span.status)
-        clone_span.set_attributes(
-            {k: v for k, v in span.attributes.items() if k != SpanAttributeKey.REQUEST_ID}
-        )
-        clone_span.set_inputs(span.inputs)
-        clone_span.set_outputs(span.outputs)
+        clone_span.set_attributes({
+            k: v for k, v in span.attributes.items() if k != SpanAttributeKey.REQUEST_ID
+        })
+        if span.inputs:
+            clone_span.set_inputs(span.inputs)
+        if span.outputs:
+            clone_span.set_outputs(span.outputs)
         for event in span.events:
             clone_span.add_event(event)
+        if span.links:
+            _logger.warning(
+                "Span links on span '%s' will not be retained when copying to a new trace "
+                "because link trace IDs may not resolve in the destination trace context.",
+                span.name,
+            )
 
         # Update trace ID and span ID
         context = span._span.get_span_context()
@@ -604,22 +1312,74 @@ class LiveSpan(Span):
             trace_flags=TraceFlags(TraceFlags.SAMPLED),
         )
 
-        if end_trace:
-            clone_span.end(end_time_ns=span.end_time_ns)
-
         return clone_span
 
 
 NO_OP_SPAN_TRACE_ID = "MLFLOW_NO_OP_SPAN_TRACE_ID"
 
 
+class LazySpan(Span):
+    """
+    A span that keeps its stored dict form and only builds an OTel-backed Span
+    when a property or conversion that needs one is accessed.
+
+    TRACKING_STORE rows already persist the span as JSON. Returning ``LazySpan``
+    from the store avoids an eager ``json.loads`` → ``Span.from_dict`` →
+    ``to_dict``/``to_otel_proto`` round-trip when the consumer only needs the
+    dict (for example ``get-trace-artifact`` or ``TraceData.to_dict``).
+    """
+
+    def __init__(self, span_dict: dict[str, Any]):
+        # Skip Span.__init__: we intentionally avoid constructing an OTel span
+        # until a caller needs property access or OTLP conversion.
+        self.__dict__["_span_dict"] = span_dict
+        self.__dict__["_materialized"] = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__["_span_dict"]
+
+    def _ensure_materialized(self) -> None:
+        if self.__dict__["_materialized"]:
+            return
+        span = Span.from_dict(self.__dict__["_span_dict"])
+        self.__dict__["_span"] = span._span
+        self.__dict__["_attributes"] = span._attributes
+        self.__dict__["_attachments"] = span._attachments
+        self.__dict__["_links"] = span._links
+        self.__dict__["_materialized"] = True
+
+    def __getattr__(self, name: str):
+        self._ensure_materialized()
+        return object.__getattribute__(self, name)
+
+    def __repr__(self):
+        if self.__dict__.get("_materialized"):
+            return super().__repr__()
+        span_dict = self.__dict__["_span_dict"]
+        name = span_dict.get("name")
+        attributes = span_dict.get("attributes") or {}
+        request_id = attributes.get(SpanAttributeKey.REQUEST_ID)
+        # request_id may still be JSON-encoded in persisted attributes.
+        if isinstance(request_id, str):
+            try:
+                request_id = json.loads(request_id)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return (
+            f"LazySpan(name={name!r}, trace_id={request_id!r}, "
+            f"span_id={span_dict.get('span_id')!r}, "
+            f"parent_id={span_dict.get('parent_span_id')!r})"
+        )
+
+
 class NoOpSpan(Span):
     """
     No-op implementation of the Span interface.
 
-    This instance should be returned from the mlflow.start_span context manager when span
-    creation fails. This class should have exactly the same interface as the Span so that
-    user's setter calls do not raise runtime errors.
+    Returned when span creation fails or when the span is dropped by the
+    sampler. An optional ``otel_span`` can be provided to preserve the
+    underlying OTel span context so that child spans inherit the same
+    trace ID and sampling decision.
 
     E.g.
 
@@ -632,9 +1392,10 @@ class NoOpSpan(Span):
 
     """
 
-    def __init__(self):
-        self._span = NonRecordingSpan(context=None)
+    def __init__(self, otel_span=None):
+        self._span = otel_span or NonRecordingSpan(context=None)
         self._attributes = {}
+        self._links = []
 
     @property
     def trace_id(self):
@@ -687,21 +1448,27 @@ class NoOpSpan(Span):
     def set_attribute(self, key: str, value: Any):
         pass
 
+    def set_log_level(self, level: SpanLogLevel | int | str):
+        pass
+
     def set_status(self, status: SpanStatus):
         pass
 
     def add_event(self, event: SpanEvent):
         pass
 
-    def record_exception(self, exception: Union[str, Exception]):
+    def add_link(self, link: Link) -> None:
+        pass
+
+    def record_exception(self, exception: str | Exception):
         pass
 
     def end(
         self,
-        outputs: Optional[Any] = None,
-        attributes: Optional[dict[str, Any]] = None,
-        status: Optional[Union[SpanStatus, str]] = None,
-        end_time_ns: Optional[int] = None,
+        outputs: Any | None = None,
+        attributes: dict[str, Any] | None = None,
+        status: SpanStatus | str | None = None,
+        end_time_ns: int | None = None,
     ):
         pass
 
@@ -724,15 +1491,13 @@ class _SpanAttributesRegistry:
         return {key: self.get(key) for key in self._span.attributes.keys()}
 
     def get(self, key: str):
-        serialized_value = self._span.attributes.get(key)
-        if serialized_value:
+        if serialized_value := self._span.attributes.get(key):
             try:
                 return json.loads(serialized_value)
-            except Exception as e:
-                _logger.warning(
-                    f"Failed to get value for key {key}, make sure you set the attribute "
-                    f"on mlflow Span class instead of directly to the OpenTelemetry span. {e}"
-                )
+            except Exception:
+                # If failed to deserialize (e.g., string value is directly set to OTel span),
+                # return the original value as is.
+                return serialized_value
 
     def set(self, key: str, value: Any):
         if not isinstance(key, str):
@@ -742,7 +1507,7 @@ class _SpanAttributesRegistry:
         # NB: OpenTelemetry attribute can store not only string but also a few primitives like
         #   int, float, bool, and list of them. However, we serialize all into JSON string here
         #   for the simplicity in deserialization process.
-        self._span.set_attribute(key, json.dumps(value, cls=TraceJSONEncoder, ensure_ascii=False))
+        self._span.set_attribute(key, dump_span_attribute_value(value))
 
 
 class _CachedSpanAttributesRegistry(_SpanAttributesRegistry):
@@ -754,9 +1519,14 @@ class _CachedSpanAttributesRegistry(_SpanAttributesRegistry):
     spans that are immutable, and thus implemented as a subclass of _SpanAttributesRegistry.
     """
 
-    @lru_cache(maxsize=128)
+    def __init__(self, otel_span: OTelSpan):
+        super().__init__(otel_span)
+        self._cache: dict[str, Any] = {}
+
     def get(self, key: str):
-        return super().get(key)
+        if key not in self._cache:
+            self._cache[key] = super().get(key)
+        return self._cache[key]
 
     def set(self, key: str, value: Any):
         raise MlflowException(

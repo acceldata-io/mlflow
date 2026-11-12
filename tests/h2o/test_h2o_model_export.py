@@ -2,7 +2,7 @@
 
 import json
 import os
-from collections import namedtuple
+from typing import Any, NamedTuple
 from unittest import mock
 
 import h2o
@@ -34,20 +34,21 @@ from tests.helper_functions import (
     pyfunc_serve_and_score_model,
 )
 
-ModelWithData = namedtuple("ModelWithData", ["model", "inference_data"])
+
+class ModelWithData(NamedTuple):
+    model: Any
+    inference_data: Any
 
 
 @pytest.fixture
 def h2o_iris_model():
     h2o.init()
     iris = datasets.load_iris()
-    data = h2o.H2OFrame(
-        {
-            "feature1": list(iris.data[:, 0]),
-            "feature2": list(iris.data[:, 1]),
-            "target": ([f"Flower {i}" for i in iris.target]),
-        }
-    )
+    data = h2o.H2OFrame({
+        "feature1": list(iris.data[:, 0]),
+        "feature2": list(iris.data[:, 1]),
+        "target": ([f"Flower {i}" for i in iris.target]),
+    })
     train, test = data.split_frame(ratios=[0.7])
 
     h2o_gbm = H2OGradientBoostingEstimator(ntrees=10, max_depth=6)
@@ -58,21 +59,17 @@ def h2o_iris_model():
 @pytest.fixture(scope="module")
 def h2o_iris_model_signature():
     return ModelSignature(
-        inputs=Schema(
-            [
-                ColSpec(name="feature1", type=DataType.double),
-                ColSpec(name="feature2", type=DataType.double),
-                ColSpec(name="target", type=DataType.string),
-            ]
-        ),
-        outputs=Schema(
-            [
-                ColSpec(name="predict", type=DataType.string),
-                ColSpec(name="Flower 0", type=DataType.double),
-                ColSpec(name="Flower 1", type=DataType.double),
-                ColSpec(name="Flower 2", type=DataType.double),
-            ]
-        ),
+        inputs=Schema([
+            ColSpec(name="feature1", type=DataType.double),
+            ColSpec(name="feature2", type=DataType.double),
+            ColSpec(name="target", type=DataType.string),
+        ]),
+        outputs=Schema([
+            ColSpec(name="predict", type=DataType.string),
+            ColSpec(name="Flower 0", type=DataType.double),
+            ColSpec(name="Flower 1", type=DataType.double),
+            ColSpec(name="Flower 2", type=DataType.double),
+        ]),
     )
 
 

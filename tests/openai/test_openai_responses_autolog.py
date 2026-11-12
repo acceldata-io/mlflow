@@ -1,5 +1,6 @@
 from unittest import mock
 
+import httpx
 import openai
 import pytest
 from packaging.version import Version
@@ -19,12 +20,8 @@ if Version(openai.__version__) < Version("1.66.00"):
 
 @pytest.fixture(params=[True, False], ids=["sync", "async"])
 def client(request, monkeypatch, mock_openai):
-    monkeypatch.setenvs(
-        {
-            "OPENAI_API_KEY": "test",
-            "OPENAI_API_BASE": mock_openai,
-        }
-    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test")
+    monkeypatch.setenv("OPENAI_API_BASE", mock_openai)
     if request.param:
         client = openai.OpenAI(api_key="test", base_url=mock_openai)
         client._is_async = False
@@ -65,16 +62,13 @@ async def test_responses_autolog(client, _input):
     assert span.outputs["id"] == "responses-123"
     assert span.attributes["model"] == "gpt-4o"
     assert span.attributes["temperature"] == 0
-    assert span.attributes[SpanAttributeKey.CHAT_MESSAGES] == [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": [{"type": "text", "text": "Dummy output"}]},
-    ]
 
     # Token usage should be aggregated correctly
     assert traces[0].info.token_usage == {
         TokenUsageKey.INPUT_TOKENS: 36,
         TokenUsageKey.OUTPUT_TOKENS: 87,
         TokenUsageKey.TOTAL_TOKENS: 123,
+        TokenUsageKey.CACHE_READ_INPUT_TOKENS: 0,
     }
 
 
@@ -108,25 +102,6 @@ async def test_responses_image_input_autolog(client):
     assert len(traces[0].data.spans) == 1
     span = traces[0].data.spans[0]
     assert span.span_type == SpanType.CHAT_MODEL
-    assert span.attributes[SpanAttributeKey.CHAT_MESSAGES] == [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "what is in this image?"},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
-                        "detail": None,
-                    },
-                },
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text": "Dummy output"}],
-        },
-    ]
 
 
 @pytest.mark.asyncio
@@ -147,36 +122,6 @@ async def test_responses_web_search_autolog(client):
     assert traces[0].info.status == "OK"
     assert len(traces[0].data.spans) == 1
     span = traces[0].data.spans[0]
-    assert span.attributes[SpanAttributeKey.CHAT_MESSAGES] == [
-        {
-            "role": "user",
-            "content": "What was a positive news story from today?",
-        },
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "tool_call_1",
-                    "type": "function",
-                    "function": {"name": "web_search_call", "arguments": ""},
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "content": mock.ANY,
-            "tool_call_id": "tool_call_1",
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "As of today, March 9, 2025, one notable positive news story...",
-                }
-            ],
-        },
-    ]
     assert span.attributes[SpanAttributeKey.CHAT_TOOLS] == [
         {"type": "function", "function": {"name": "web_search_preview"}}
     ]
@@ -206,39 +151,6 @@ async def test_responses_file_search_autolog(client):
     assert traces[0].info.status == "OK"
     assert len(traces[0].data.spans) == 1
     span = traces[0].data.spans[0]
-    assert span.attributes[SpanAttributeKey.CHAT_MESSAGES] == [
-        {
-            "role": "user",
-            "content": "What are the attributes of an ancient brown dragon?",
-        },
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "file_search_1",
-                    "type": "function",
-                    "function": {
-                        "name": "file_search_call",
-                        "arguments": '{"queries": ["attributes of an ancient brown dragon"]}',
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "content": mock.ANY,
-            "tool_call_id": "file_search_1",
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "The attributes of an ancient brown dragon include...",
-                }
-            ],
-        },
-    ]
     assert span.attributes[SpanAttributeKey.CHAT_TOOLS] == [
         {"type": "function", "function": {"name": "file_search"}}
     ]
@@ -292,56 +204,8 @@ async def test_responses_computer_use_autolog(client):
     assert llm_span_1.span_type == SpanType.CHAT_MODEL
     assert llm_span_1.inputs["model"] == "computer-use-preview"
     assert llm_span_1.outputs["id"] == "responses-123"
-    assert llm_span_1.attributes[SpanAttributeKey.CHAT_MESSAGES] == [
-        {
-            "role": "user",
-            "content": "Check the latest OpenAI news on bing.com.",
-        },
-        {
-            "role": "assistant",
-            "content": "Clicking on the browser address bar.",
-        },
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "computer_call_1",
-                    "type": "function",
-                    "function": {"name": "computer_call", "arguments": mock.ANY},
-                }
-            ],
-        },
-    ]
     assert llm_span_1.attributes[SpanAttributeKey.CHAT_TOOLS] == [
         {"type": "function", "function": {"name": "computer_use_preview"}}
-    ]
-
-    llm_span_2 = traces[0].data.spans[2]
-    assert llm_span_2.attributes[SpanAttributeKey.CHAT_MESSAGES] == [
-        {
-            "role": "tool",
-            "content": [
-                {
-                    "image_url": {"url": "data:image/png;base64,screenshot_base64"},
-                    "type": "image_url",
-                }
-            ],
-            "tool_call_id": "computer_call_1",
-        },
-        {
-            "role": "assistant",
-            "content": "Clicking on the browser address bar.",
-        },
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "computer_call_1",
-                    "type": "function",
-                    "function": {"name": "computer_call", "arguments": mock.ANY},
-                }
-            ],
-        },
     ]
 
 
@@ -386,28 +250,92 @@ async def test_responses_function_calling_autolog(client):
     assert span.span_type == SpanType.CHAT_MODEL
     assert span.inputs["model"] == "gpt-4o"
     assert span.outputs["id"] == "responses-123"
-    assert span.attributes[SpanAttributeKey.CHAT_MESSAGES] == [
-        {
-            "role": "user",
-            "content": "What is the weather like in Boston today?",
-        },
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "function_call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "get_current_weather",
-                        "arguments": '{"location":"Boston, MA","unit":"celsius"}',
-                    },
-                }
-            ],
-        },
-    ]
     assert span.attributes[SpanAttributeKey.CHAT_TOOLS] == [
         {"type": "function", "function": {k: v for k, v in tools[0].items() if k != "type"}}
     ]
+    assert span.attributes[SpanAttributeKey.MESSAGE_FORMAT] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_responses_autolog_with_cached_tokens(client):
+    mlflow.openai.autolog()
+
+    mock_response = {
+        "id": "responses-cached",
+        "object": "response",
+        "created": 1589478378,
+        "status": "completed",
+        "error": None,
+        "incomplete_details": None,
+        "max_output_tokens": None,
+        "model": "gpt-4o",
+        "output": [
+            {
+                "type": "message",
+                "id": "test",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hello"}],
+            }
+        ],
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "reasoning": {"effort": None, "generate_summary": None},
+        "store": True,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": {
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 40},
+            "output_tokens": 50,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 150,
+        },
+        "user": None,
+        "metadata": {},
+    }
+    if client._is_async:
+        patch_target = "httpx.AsyncClient.send"
+
+        async def send_patch(self, request, *args, **kwargs):
+            return httpx.Response(status_code=200, request=request, json=mock_response)
+
+    else:
+        patch_target = "httpx.Client.send"
+
+        def send_patch(self, request, *args, **kwargs):
+            return httpx.Response(status_code=200, request=request, json=mock_response)
+
+    with mock.patch(patch_target, send_patch):
+        response = client.responses.create(
+            input="Hello",
+            model="gpt-4o",
+            temperature=0,
+        )
+        if client._is_async:
+            response = await response
+
+    traces = get_traces()
+    assert len(traces) == 1
+    span = traces[0].data.spans[0]
+
+    assert span.get_attribute(SpanAttributeKey.CHAT_USAGE) == {
+        TokenUsageKey.INPUT_TOKENS: 100,
+        TokenUsageKey.OUTPUT_TOKENS: 50,
+        TokenUsageKey.TOTAL_TOKENS: 150,
+        TokenUsageKey.CACHE_READ_INPUT_TOKENS: 40,
+    }
+
+    assert traces[0].info.token_usage == {
+        TokenUsageKey.INPUT_TOKENS: 100,
+        TokenUsageKey.OUTPUT_TOKENS: 50,
+        TokenUsageKey.TOTAL_TOKENS: 150,
+        TokenUsageKey.CACHE_READ_INPUT_TOKENS: 40,
+    }
 
 
 @pytest.mark.asyncio
@@ -434,6 +362,8 @@ async def test_responses_stream_autolog(client):
     span = traces[0].data.spans[0]
     assert span.span_type == SpanType.CHAT_MODEL
     assert span.outputs["id"] == "responses-123"
+    # "logprobs" is only returned from certain version of OpenAI SDK
+    span.outputs["output"][0]["content"][0].pop("logprobs", None)
     assert span.outputs["output"][0]["content"] == [
         {
             "text": "Dummy output",
@@ -443,14 +373,11 @@ async def test_responses_stream_autolog(client):
     ]
     assert span.attributes["model"] == "gpt-4o"
     assert span.attributes["stream"] is True
-    assert span.attributes[SpanAttributeKey.CHAT_MESSAGES] == [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": [{"type": "text", "text": "Dummy output"}]},
-    ]
 
     # Token usage should be aggregated correctly
     assert traces[0].info.token_usage == {
         TokenUsageKey.INPUT_TOKENS: 36,
         TokenUsageKey.OUTPUT_TOKENS: 87,
         TokenUsageKey.TOTAL_TOKENS: 123,
+        TokenUsageKey.CACHE_READ_INPUT_TOKENS: 0,
     }

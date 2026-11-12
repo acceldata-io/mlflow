@@ -5,11 +5,9 @@ import pytest
 from aiohttp import ClientTimeout
 from fastapi.encoders import jsonable_encoder
 
-from mlflow.gateway.config import MlflowModelServingConfig, RouteConfig
-from mlflow.gateway.constants import (
-    MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS,
-    MLFLOW_SERVING_RESPONSE_KEY,
-)
+from mlflow.environment_variables import MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS
+from mlflow.gateway.config import EndpointConfig, MlflowModelServingConfig
+from mlflow.gateway.constants import MLFLOW_SERVING_RESPONSE_KEY
 from mlflow.gateway.exceptions import AIGatewayException
 from mlflow.gateway.providers.mlflow import MlflowModelServingProvider
 from mlflow.gateway.schemas import chat, completions, embeddings
@@ -44,7 +42,7 @@ async def test_completions():
         mock.patch("time.time", return_value=1677858242),
         mock.patch("aiohttp.ClientSession", return_value=mock_client) as mock_build_client,
     ):
-        provider = MlflowModelServingProvider(RouteConfig(**config))
+        provider = MlflowModelServingProvider(EndpointConfig(**config))
         payload = {
             "prompt": "Is this a test?",
             "temperature": 0.0,
@@ -74,7 +72,7 @@ async def test_completions():
                     "n": 1,
                 },
             },
-            timeout=ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS),
+            timeout=ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS.get()),
         )
 
 
@@ -114,7 +112,7 @@ async def test_completions():
 )
 def test_valid_completions_input_parsing(input_data, expected_output):
     config = completions_config()
-    provider = MlflowModelServingProvider(RouteConfig(**config))
+    provider = MlflowModelServingProvider(EndpointConfig(**config))
     parsed = provider._process_completions_response_for_mlflow_serving(input_data)
 
     assert parsed == expected_output
@@ -133,7 +131,7 @@ def test_valid_completions_input_parsing(input_data, expected_output):
 )
 def test_validation_errors(invalid_data):
     config = completions_config()
-    provider = MlflowModelServingProvider(RouteConfig(**config))
+    provider = MlflowModelServingProvider(EndpointConfig(**config))
     with pytest.raises(AIGatewayException, match=r".*") as e:
         provider._process_completions_response_for_mlflow_serving(invalid_data)
     assert e.value.status_code == 502
@@ -142,11 +140,11 @@ def test_validation_errors(invalid_data):
 
 def test_invalid_return_key_from_mlflow_serving():
     config = completions_config()
-    provider = MlflowModelServingProvider(RouteConfig(**config))
+    provider = MlflowModelServingProvider(EndpointConfig(**config))
     with pytest.raises(AIGatewayException, match=r".*") as e:
-        provider._process_completions_response_for_mlflow_serving(
-            {"invalid_return_key": ["invalid", "response"]}
-        )
+        provider._process_completions_response_for_mlflow_serving({
+            "invalid_return_key": ["invalid", "response"]
+        })
 
     assert "1 validation error for ServingTextResponse\npredictions" in e.value.detail
     assert e.value.status_code == 502
@@ -176,7 +174,7 @@ async def test_embeddings():
     mock_client = mock_http_client(MockAsyncResponse(resp))
 
     with mock.patch("aiohttp.ClientSession", return_value=mock_client) as mock_build_client:
-        provider = MlflowModelServingProvider(RouteConfig(**config))
+        provider = MlflowModelServingProvider(EndpointConfig(**config))
         payload = {"input": ["test1", "test2"]}
         response = await provider.embeddings(embeddings.RequestPayload(**payload))
         assert jsonable_encoder(response) == {
@@ -206,7 +204,7 @@ async def test_embeddings():
         mock_client.post.assert_called_once_with(
             "http://127.0.0.1:2000/invocations",
             json={"inputs": ["test1", "test2"]},
-            timeout=ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS),
+            timeout=ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS.get()),
         )
 
 
@@ -223,7 +221,7 @@ async def test_embeddings():
 )
 def test_invalid_embeddings_response(response):
     config = embedding_config()
-    provider = MlflowModelServingProvider(RouteConfig(**config))
+    provider = MlflowModelServingProvider(EndpointConfig(**config))
     with pytest.raises(AIGatewayException, match=r".*") as e:
         provider._process_embeddings_response_for_mlflow_serving(response)
 
@@ -258,7 +256,7 @@ async def test_chat():
         mock.patch("time.time", return_value=1700242674),
         mock.patch("aiohttp.ClientSession", return_value=mock_client) as mock_build_client,
     ):
-        provider = MlflowModelServingProvider(RouteConfig(**config))
+        provider = MlflowModelServingProvider(EndpointConfig(**config))
         payload = {"messages": [{"role": "user", "content": "Is this a test?"}]}
         response = await provider.chat(chat.RequestPayload(**payload))
         assert jsonable_encoder(response) == {
@@ -266,6 +264,7 @@ async def test_chat():
             "created": 1700242674,
             "object": "chat.completion",
             "model": "chat-bot-9000",
+            "provider": "mlflow-model-serving",
             "choices": [
                 {
                     "message": {
@@ -289,9 +288,9 @@ async def test_chat():
             "http://127.0.0.1:4000/invocations",
             json={
                 "inputs": ["Is this a test?"],
-                "params": {"temperature": 0.0, "n": 1},
+                "params": {"n": 1},
             },
-            timeout=ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS),
+            timeout=ClientTimeout(total=MLFLOW_GATEWAY_ROUTE_TIMEOUT_SECONDS.get()),
         )
 
 
@@ -302,7 +301,7 @@ async def test_chat_exception_raised_for_multiple_elements_in_query():
     mock_client = mock_http_client(MockAsyncResponse(resp))
 
     with mock.patch("aiohttp.ClientSession", return_value=mock_client):
-        provider = MlflowModelServingProvider(RouteConfig(**config))
+        provider = MlflowModelServingProvider(EndpointConfig(**config))
         payload = {
             "messages": [
                 {"role": "user", "content": "Is this a test?"},

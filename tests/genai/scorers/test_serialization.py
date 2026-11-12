@@ -1,11 +1,23 @@
 import json
-from unittest.mock import patch
+from typing import Any, ClassVar
+from unittest.mock import Mock, patch
 
 import pytest
 
+import mlflow
 from mlflow.entities import Feedback
+from mlflow.entities.scorer import ScorerVersion
 from mlflow.exceptions import MlflowException
 from mlflow.genai.scorers import Scorer, scorer
+from mlflow.genai.scorers.base import SerializedScorer
+from mlflow.genai.scorers.builtin_scorers import Guidelines
+
+
+@pytest.fixture(autouse=True)
+def mock_databricks_runtime():
+    with patch("mlflow.genai.scorers.base.is_databricks_uri", return_value=True):
+        yield
+
 
 # ============================================================================
 # FORMAT VALIDATION TESTS (Minimal - just check serialization structure)
@@ -13,8 +25,6 @@ from mlflow.genai.scorers import Scorer, scorer
 
 
 def test_decorator_scorer_serialization_format():
-    """Test that decorator scorers serialize with correct format."""
-
     @scorer(name="test_scorer", aggregations=["mean"])
     def test_scorer(outputs):
         return outputs == "correct"
@@ -40,7 +50,6 @@ def test_decorator_scorer_serialization_format():
 
 
 def test_builtin_scorer_serialization_format():
-    """Test that builtin scorers serialize with correct format."""
     from mlflow.genai.scorers.builtin_scorers import RelevanceToQuery
 
     serialized = RelevanceToQuery().model_dump()
@@ -72,8 +81,6 @@ def test_builtin_scorer_serialization_format():
 
 
 def test_simple_scorer_round_trip():
-    """Test basic round-trip serialization and execution."""
-
     @scorer
     def simple_scorer(outputs):
         return outputs == "correct"
@@ -93,8 +100,6 @@ def test_simple_scorer_round_trip():
 
 
 def test_custom_name_and_aggregations_round_trip():
-    """Test round-trip with custom name and aggregations."""
-
     @scorer(name="length_check", aggregations=["mean", "max"])
     def my_scorer(inputs, outputs):
         return len(outputs) > len(inputs)
@@ -115,14 +120,16 @@ def test_custom_name_and_aggregations_round_trip():
 
 
 def test_multiple_parameters_round_trip():
-    """Test round-trip with multiple parameters."""
-
     @scorer
     def multi_param_scorer(inputs, outputs, expectations):
         return outputs.startswith(inputs) and len(outputs) > expectations.get("min_length", 0)
 
     # Test original
-    test_args = {"inputs": "Hello", "outputs": "Hello world!", "expectations": {"min_length": 5}}
+    test_args = {
+        "inputs": "Hello",
+        "outputs": "Hello world!",
+        "expectations": {"min_length": 5},
+    }
     assert multi_param_scorer(**test_args) is True
 
     # Round-trip
@@ -137,8 +144,6 @@ def test_multiple_parameters_round_trip():
 
 
 def test_complex_logic_round_trip():
-    """Test round-trip with complex control flow and logic."""
-
     @scorer
     def complex_scorer(outputs):
         if not outputs:
@@ -175,11 +180,9 @@ def test_complex_logic_round_trip():
 
 
 def test_imports_and_feedback_round_trip():
-    """Test round-trip with imports and Feedback return."""
-
     @scorer
     def feedback_scorer(outputs):
-        import re  # clint: disable=lazy-builtin-import
+        import re  # clint: disable=lazy-import
 
         pattern = r"\b\w+\b"
         words = re.findall(pattern, outputs)
@@ -203,8 +206,6 @@ def test_imports_and_feedback_round_trip():
 
 
 def test_default_parameters_round_trip():
-    """Test round-trip with default parameter values."""
-
     @scorer
     def default_scorer(outputs, threshold=5):
         return len(outputs) > threshold
@@ -224,8 +225,6 @@ def test_default_parameters_round_trip():
 
 
 def test_json_workflow_round_trip():
-    """Test complete JSON serialization workflow."""
-
     @scorer(name="json_test", aggregations=["mean"])
     def json_scorer(outputs):
         return len(outputs.split()) > 3
@@ -248,8 +247,6 @@ def test_json_workflow_round_trip():
 
 
 def test_end_to_end_complex_round_trip():
-    """Test complex end-to-end scenario with all features."""
-
     @scorer(name="complete_test", aggregations=["mean", "max"])
     def complete_scorer(inputs, outputs, expectations):
         input_words = len(inputs.split())
@@ -280,8 +277,57 @@ def test_end_to_end_complex_round_trip():
     assert original_result == deserialized_result is True
 
 
+def test_deserialized_scorer_runs_without_global_context():
+    # Create a simple scorer that only uses built-in functions and parameters
+    @scorer(name="isolated_test")
+    def simple_scorer(outputs):
+        # Only use built-in functions and the parameter - no external dependencies
+        return len(outputs.split()) > 2
+
+    # Test original works
+    assert simple_scorer(outputs="one two three") is True
+    assert simple_scorer(outputs="one two") is False
+
+    # Serialize the scorer
+    serialized_data = simple_scorer.model_dump()
+
+    # Test deserialized scorer in completely isolated namespace using exec
+    test_code = """
+# Import required modules in isolated namespace
+from mlflow.genai.scorers import Scorer
+
+# Deserialize the scorer (no external context available)
+deserialized = Scorer.model_validate(serialized_data)
+
+# Test that it can run successfully in isolation
+result1 = deserialized(outputs="one two three")
+result2 = deserialized(outputs="one two")
+result3 = deserialized(outputs="hello world test case")
+
+# Store results for verification
+test_results = {
+    "result1": result1,
+    "result2": result2,
+    "result3": result3,
+    "name": deserialized.name,
+    "aggregations": deserialized.aggregations
+}
+"""
+
+    # Execute in isolated namespace with only serialized_data available
+    isolated_namespace = {"serialized_data": serialized_data}
+    exec(test_code, isolated_namespace)  # noqa: S102
+
+    # Verify results from isolated execution
+    results = isolated_namespace["test_results"]
+    assert results["result1"] is True  # "one two three" has 3 words > 2
+    assert results["result2"] is False  # "one two" has 2 words, not > 2
+    assert results["result3"] is True  # "hello world test case" has 4 words > 2
+    assert results["name"] == "isolated_test"
+    assert results["aggregations"] is None
+
+
 def test_builtin_scorer_round_trip():
-    """Test builtin scorer serialization and execution with mocking."""
     # from mlflow.genai.scorers import relevance_to_query
     from mlflow.genai.scorers.builtin_scorers import RelevanceToQuery
 
@@ -316,6 +362,8 @@ def test_builtin_scorer_round_trip():
             "explicit programming."
         ),
         name="relevance_to_query",
+        model=None,
+        extra_headers=None,
     )
 
     assert isinstance(result, Feedback)
@@ -325,7 +373,6 @@ def test_builtin_scorer_round_trip():
 
 
 def test_builtin_scorer_with_parameters_round_trip():
-    """Test builtin scorer with custom parameters (like Guidelines with guidelines)."""
     from mlflow.genai.scorers.builtin_scorers import Guidelines
 
     # Create scorer with custom parameters
@@ -388,6 +435,8 @@ def test_builtin_scorer_with_parameters_round_trip():
             ),
         },
         name="tone",
+        model=None,
+        extra_headers=None,
     )
 
     assert isinstance(result, Feedback)
@@ -396,8 +445,6 @@ def test_builtin_scorer_with_parameters_round_trip():
 
 
 def test_direct_subclass_scorer_rejected():
-    """Test that direct subclassing of Scorer is rejected during serialization."""
-
     class DirectSubclassScorer(Scorer):
         """An unsupported direct subclass of Scorer."""
 
@@ -430,7 +477,6 @@ def test_direct_subclass_scorer_rejected():
 
 
 def test_builtin_scorer_with_aggregations_round_trip():
-    """Test builtin scorer with aggregations serialization and execution."""
     from mlflow.genai.scorers.builtin_scorers import RelevanceToQuery
 
     scorer_with_aggs = RelevanceToQuery(name="relevance_with_aggs", aggregations=["mean", "max"])
@@ -480,7 +526,6 @@ def test_builtin_scorer_with_aggregations_round_trip():
 
 
 def test_builtin_scorer_with_custom_name_compatibility():
-    """Test builtin scorer with custom name from fixed serialized string."""
     # Fixed serialized string for Guidelines scorer with custom name and parameters
     fixed_serialized_data = {
         "name": "custom_guidelines",
@@ -492,7 +537,10 @@ def test_builtin_scorer_with_custom_name_compatibility():
             "name": "custom_guidelines",
             "aggregations": ["mean", "max"],
             "required_columns": ["inputs", "outputs"],
-            "guidelines": ["Be polite and professional", "Provide accurate information"],
+            "guidelines": [
+                "Be polite and professional",
+                "Provide accurate information",
+            ],
         },
         "call_source": None,
         "call_signature": None,
@@ -508,12 +556,14 @@ def test_builtin_scorer_with_custom_name_compatibility():
     assert isinstance(deserialized, Guidelines)
     assert deserialized.name == "custom_guidelines"
     assert deserialized.aggregations == ["mean", "max"]
-    assert deserialized.guidelines == ["Be polite and professional", "Provide accurate information"]
+    assert deserialized.guidelines == [
+        "Be polite and professional",
+        "Provide accurate information",
+    ]
     assert deserialized.required_columns == {"inputs", "outputs"}
 
 
 def test_custom_scorer_compatibility_from_fixed_string():
-    """Test that custom scorers can be deserialized from a fixed serialized string."""
     # Fixed serialized string representing a simple custom scorer
     fixed_serialized_data = {
         "name": "word_count_scorer",
@@ -541,7 +591,6 @@ def test_custom_scorer_compatibility_from_fixed_string():
 
 
 def test_complex_custom_scorer_compatibility():
-    """Test complex custom scorer with multiple parameters from fixed string."""
     # Fixed serialized string for a more complex custom scorer
     fixed_serialized_data = {
         "name": "length_comparison",
@@ -577,3 +626,275 @@ def test_complex_custom_scorer_compatibility():
     )  # 2 < 5 * 1.5 (7.5)
 
     assert deserialized(inputs="test", outputs="test", expectations={}) is True  # 4 >= 4 * 1.0
+
+
+def test_decorator_scorer_multiple_serialization_round_trips():
+    @scorer
+    def multi_round_scorer(outputs):
+        return len(outputs) > 5
+
+    # First serialization
+    first_dump = multi_round_scorer.model_dump()
+
+    # Deserialize
+    recovered = Scorer.model_validate(first_dump)
+
+    # Second serialization - this should work now with caching
+    second_dump = recovered.model_dump()
+
+    # Verify the dumps are identical
+    assert first_dump == second_dump
+
+    # Third serialization to ensure it's truly reusable
+    third_dump = recovered.model_dump()
+    assert first_dump == third_dump
+
+    # Verify functionality is preserved
+    assert recovered(outputs="hello world") is True
+    assert recovered(outputs="hi") is False
+
+
+def test_builtin_scorer_instructions_preserved_through_serialization():
+    scorer = Guidelines(name="test_guidelines", guidelines=["Be helpful"])
+
+    original_instructions = scorer.instructions
+
+    serialized = scorer.model_dump()
+    assert "builtin_scorer_pydantic_data" in serialized
+    pydantic_data = serialized["builtin_scorer_pydantic_data"]
+
+    assert "instructions" in pydantic_data
+    assert pydantic_data["instructions"] == original_instructions
+
+    deserialized = Scorer.model_validate(serialized)
+
+    assert isinstance(deserialized, Guidelines)
+    assert deserialized.instructions == original_instructions
+    assert deserialized.name == "test_guidelines"
+    assert deserialized.guidelines == ["Be helpful"]
+
+
+# ============================================================================
+# THIRD-PARTY SCORER (de)serialization
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    ("third_party_data", "match"),
+    [
+        pytest.param(
+            {
+                "module": "os",
+                "class": "system",
+                "metric_name": "system",
+                "model": None,
+                "kwargs": {},
+            },
+            "not in the allow-list",
+            id="module_not_allow_listed",
+        ),
+        pytest.param(
+            {
+                "module": "mlflow.genai.scorers.ragas",
+                "class": "",
+                "metric_name": "Faithfulness",
+                "model": None,
+                "kwargs": {},
+            },
+            "missing required fields",
+            id="missing_class_name",
+        ),
+        pytest.param(
+            {
+                "module": "mlflow.genai.scorers.ragas",
+                "class": "ExactMatch",
+                "metric_name": "",
+                "model": None,
+                "kwargs": {},
+            },
+            "missing required fields",
+            id="missing_metric_name",
+        ),
+    ],
+)
+def test_third_party_scorer_invalid_payload_rejected(third_party_data, match):
+    payload = SerializedScorer(name="bad", third_party_scorer_data=third_party_data)
+    with pytest.raises(MlflowException, match=match):
+        Scorer.model_validate(payload)
+
+
+def test_third_party_scorer_import_failure():
+    payload = SerializedScorer(
+        name="x",
+        third_party_scorer_data={
+            "module": "mlflow.genai.scorers.ragas",
+            "class": "ExactMatch",
+            "metric_name": "ExactMatch",
+            "model": None,
+            "kwargs": {},
+        },
+    )
+    with patch(
+        "mlflow.genai.scorers.base.importlib.import_module",
+        side_effect=ImportError("library not installed"),
+    ):
+        with pytest.raises(MlflowException, match="could not import"):
+            Scorer.model_validate(payload)
+
+
+def test_third_party_scorer_class_not_found():
+    payload = SerializedScorer(
+        name="x",
+        third_party_scorer_data={
+            "module": "mlflow.genai.scorers.ragas",
+            "class": "DoesNotExist",
+            "metric_name": "X",
+            "model": None,
+            "kwargs": {},
+        },
+    )
+    with patch(
+        "mlflow.genai.scorers.base.importlib.import_module",
+        return_value=Mock(spec=[]),
+    ):
+        with pytest.raises(MlflowException, match="not found in module"):
+            Scorer.model_validate(payload)
+
+
+def test_third_party_scorer_metric_name_mismatch_with_classvar():
+    class RenamedScorer:
+        metric_name: ClassVar[str] = "NewName"
+
+    fake_module = Mock(RenamedScorer=RenamedScorer)
+    payload = SerializedScorer(
+        name="stale",
+        third_party_scorer_data={
+            "module": "mlflow.genai.scorers.ragas",
+            "class": "RenamedScorer",
+            "metric_name": "OldName",
+            "model": None,
+            "kwargs": {},
+        },
+    )
+    with patch(
+        "mlflow.genai.scorers.base.importlib.import_module",
+        return_value=fake_module,
+    ):
+        with pytest.raises(MlflowException, match="does not match class"):
+            Scorer.model_validate(payload)
+
+
+def test_third_party_scorer_instantiation_failure():
+    class BoomScorer:
+        def __init__(self, **kwargs):
+            raise RuntimeError("boom")
+
+    fake_module = Mock(BoomScorer=BoomScorer)
+    payload = SerializedScorer(
+        name="x",
+        third_party_scorer_data={
+            "module": "mlflow.genai.scorers.ragas",
+            "class": "BoomScorer",
+            "metric_name": "X",
+            "model": None,
+            "kwargs": {},
+        },
+    )
+    with patch(
+        "mlflow.genai.scorers.base.importlib.import_module",
+        return_value=fake_module,
+    ):
+        with pytest.raises(MlflowException, match="failed to instantiate"):
+            Scorer.model_validate(payload)
+
+
+def test_serialized_scorer_rejects_multiple_scorer_field_types():
+    with pytest.raises(ValueError, match="cannot have multiple types"):
+        SerializedScorer(
+            name="oops",
+            builtin_scorer_class="Safety",
+            third_party_scorer_data={
+                "module": "mlflow.genai.scorers.ragas",
+                "class": "ExactMatch",
+                "metric_name": "ExactMatch",
+                "model": None,
+                "kwargs": {},
+            },
+        )
+
+
+def test_from_dict_round_trips_known_fields():
+    @scorer(name="round_trip")
+    def my_scorer(outputs):
+        return outputs == "ok"
+
+    payload = my_scorer.model_dump()
+    restored = SerializedScorer.from_dict(payload)
+    assert restored.name == "round_trip"
+    assert restored.call_source is not None
+
+
+def _deserialize_via_scorer_version(payload: dict[str, Any]) -> SerializedScorer:
+    return ScorerVersion(
+        experiment_id="123",
+        scorer_name=payload["name"],
+        scorer_version=1,
+        serialized_scorer=json.dumps(payload),
+        creation_time=0,
+    ).serialized_scorer
+
+
+def _formatted_error_logs(mock_logger) -> str:
+    return " ".join(
+        call.args[0] % call.args[1:] if len(call.args) > 1 else call.args[0]
+        for call in mock_logger.error.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    "deserialize",
+    [
+        SerializedScorer.from_dict,
+        Scorer.model_validate,
+        _deserialize_via_scorer_version,
+    ],
+    ids=[
+        "SerializedScorer.from_dict",
+        "Scorer.model_validate",
+        "ScorerVersion.serialized_scorer",
+    ],
+)
+def test_unknown_field_is_dropped_with_version_aware_log(deserialize):
+    payload = {
+        "name": "future_scorer",
+        "mlflow_version": "99.0.0",
+        "call_source": "return 1",
+        "call_signature": "(outputs)",
+        "original_func_name": "future_scorer",
+        "field_from_the_future": "value",
+    }
+    with patch("mlflow.genai.scorers.base._logger") as mock_logger:
+        result = deserialize(payload)
+    assert result.name == "future_scorer"
+    assert not hasattr(result, "field_from_the_future")
+    log_message = _formatted_error_logs(mock_logger)
+    assert "field_from_the_future" in log_message
+    assert "future_scorer" in log_message
+    assert "99.0.0" in log_message
+    assert mlflow.__version__ in log_message
+
+
+def test_from_dict_unknown_field_falls_back_to_unknown_serialized_version():
+    payload = {
+        "name": "no_version",
+        "call_source": "return 1",
+        "call_signature": "(outputs)",
+        "original_func_name": "no_version",
+        "mystery_field": True,
+    }
+    with patch("mlflow.genai.scorers.base._logger") as mock_logger:
+        result = SerializedScorer.from_dict(payload)
+    assert result.name == "no_version"
+    log_message = _formatted_error_logs(mock_logger)
+    assert "unknown" in log_message
+    assert "mystery_field" in log_message

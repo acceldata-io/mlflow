@@ -1,4 +1,6 @@
-import { RunsMetricsLinePlot, RunsMetricsLinePlotProps } from './RunsMetricsLinePlot';
+import { jest, describe, test, expect } from '@jest/globals';
+import type { RunsMetricsLinePlotProps } from './RunsMetricsLinePlot';
+import { RunsMetricsLinePlot } from './RunsMetricsLinePlot';
 import { renderWithIntl, cleanup } from '../../../../common/utils/TestUtils.react18';
 import { LazyPlot } from '../../LazyPlot';
 import type { PlotParams } from 'react-plotly.js';
@@ -48,5 +50,25 @@ describe('RunsMetricsLinePlot', () => {
     expect(getLastRenderedPlotProps().data[0]).toEqual(expect.objectContaining({ x: [1, 2, 3] }));
     expect(getLastRenderedPlotProps().data[0]).toEqual(expect.objectContaining({ y: [10, 20, 30] }));
     cleanup();
+  });
+
+  test('it should clear zoom ranges after autoscale', () => {
+    const { rerender } = renderWithIntl(<RunsMetricsLinePlot {...defaultProps} xRange={[1, 2]} yRange={[10, 20]} />);
+
+    expect(getLastRenderedPlotProps().layout).toEqual(
+      expect.objectContaining({
+        xaxis: expect.objectContaining({ range: [1, 2], autorange: false }),
+        yaxis: expect.objectContaining({ range: [10, 20], autorange: false }),
+      }),
+    );
+
+    rerender(<RunsMetricsLinePlot {...defaultProps} />);
+
+    expect(getLastRenderedPlotProps().layout).toEqual(
+      expect.objectContaining({
+        xaxis: expect.objectContaining({ range: undefined, autorange: true }),
+        yaxis: expect.objectContaining({ range: undefined, autorange: true }),
+      }),
+    );
   });
 });

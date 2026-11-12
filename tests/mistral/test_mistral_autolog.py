@@ -1,20 +1,41 @@
 from unittest.mock import patch
 
 import httpx
-import mistralai
-from mistralai.models import (
-    AssistantMessage,
-    ChatCompletionChoice,
-    ChatCompletionResponse,
-    FunctionCall,
-    ToolCall,
-    UsageInfo,
-)
+import pytest
+
+try:
+    from mistralai.client import Mistral  # mistralai >= 2.0
+    from mistralai.client.models import (
+        AssistantMessage,
+        ChatCompletionChoice,
+        ChatCompletionResponse,
+        FunctionCall,
+        ToolCall,
+        UsageInfo,
+    )
+
+    CHAT_DO_REQUEST_PATH = "mistralai.client.chat.Chat.do_request"
+    CHAT_DO_REQUEST_ASYNC_PATH = "mistralai.client.chat.Chat.do_request_async"
+except ImportError:
+    from mistralai import Mistral  # mistralai < 2.0
+    from mistralai.models import (
+        AssistantMessage,
+        ChatCompletionChoice,
+        ChatCompletionResponse,
+        FunctionCall,
+        ToolCall,
+        UsageInfo,
+    )
+
+    CHAT_DO_REQUEST_PATH = "mistralai.chat.Chat.do_request"
+    CHAT_DO_REQUEST_ASYNC_PATH = "mistralai.chat.Chat.do_request_async"
 from pydantic import BaseModel
 
 import mlflow.mistral
+from mlflow.entities import SpanLogLevel
 from mlflow.entities.span import SpanType
-from mlflow.tracing.constant import SpanAttributeKey
+from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey
+from mlflow.version import IS_TRACING_SDK_ONLY
 
 from tests.tracing.helper import get_traces
 
@@ -145,14 +166,14 @@ def _make_httpx_response(response: BaseModel, status_code: int = 200) -> httpx.R
     )
 
 
-@patch(
-    "mistralai.chat.Chat.do_request",
-    return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_RESPONSE),
-)
-def test_chat_complete_autolog(mock_complete):
-    mlflow.mistral.autolog()
-    client = mistralai.Mistral(api_key="test_key")
-    client.chat.complete(**DUMMY_CHAT_COMPLETION_REQUEST)
+def test_chat_complete_autolog(mock_litellm_cost):
+    with patch(
+        CHAT_DO_REQUEST_PATH,
+        return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_RESPONSE),
+    ):
+        mlflow.mistral.autolog()
+        client = Mistral(api_key="test_key")
+        client.chat.complete(**DUMMY_CHAT_COMPLETION_REQUEST)
 
     traces = get_traces()
     assert len(traces) == 1
@@ -161,6 +182,7 @@ def test_chat_complete_autolog(mock_complete):
     span = traces[0].data.spans[0]
     assert span.name == "Chat.complete"
     assert span.span_type == SpanType.CHAT_MODEL
+    assert span.log_level == SpanLogLevel.INFO
     assert span.inputs == DUMMY_CHAT_COMPLETION_REQUEST
     # Only keep input_tokens / output_tokens fields in usage dict.
     span.outputs["usage"] = {
@@ -168,39 +190,42 @@ def test_chat_complete_autolog(mock_complete):
         for key in ["prompt_tokens", "completion_tokens", "total_tokens"]
     }
     assert span.outputs == DUMMY_CHAT_COMPLETION_RESPONSE.model_dump()
+    assert span.model_name == "test_model"
+    assert span.get_attribute(SpanAttributeKey.MESSAGE_FORMAT) == "mistral"
+    assert traces[0].info.token_usage == {
+        TokenUsageKey.INPUT_TOKENS: 10,
+        TokenUsageKey.OUTPUT_TOKENS: 18,
+        TokenUsageKey.TOTAL_TOKENS: 28,
+    }
+    if not IS_TRACING_SDK_ONLY:
+        # Verify cost is calculated (10 input tokens * 1.0 + 18 output tokens * 2.0)
+        assert span.llm_cost == {
+            "input_cost": 10.0,
+            "output_cost": 36.0,
+            "total_cost": 46.0,
+        }
 
-    assert span.get_attribute(SpanAttributeKey.CHAT_MESSAGES) == [
-        {
-            "role": "user",
-            "content": "test message",
-            "tool_calls": None,
-            "tool_call_id": None,
-        },
-        {
-            "role": "assistant",
-            "content": "test answer",
-            "tool_calls": None,
-            "tool_call_id": None,
-        },
-    ]
-
-    mlflow.mistral.autolog(disable=True)
-    client = mistralai.Mistral(api_key="test_key")
-    client.chat.complete(**DUMMY_CHAT_COMPLETION_REQUEST)
+    with patch(
+        CHAT_DO_REQUEST_PATH,
+        return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_RESPONSE),
+    ):
+        mlflow.mistral.autolog(disable=True)
+        client = Mistral(api_key="test_key")
+        client.chat.complete(**DUMMY_CHAT_COMPLETION_REQUEST)
 
     # No new trace should be created
     traces = get_traces()
     assert len(traces) == 1
 
 
-@patch(
-    "mistralai.chat.Chat.do_request",
-    return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_WITH_TOOLS_RESPONSE),
-)
-def test_chat_complete_autolog_tool_calling(mock_complete):
-    mlflow.mistral.autolog()
-    client = mistralai.Mistral(api_key="test_key")
-    client.chat.complete(**DUMMY_CHAT_COMPLETION_WITH_TOOLS_REQUEST)
+def test_chat_complete_autolog_tool_calling():
+    with patch(
+        CHAT_DO_REQUEST_PATH,
+        return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_WITH_TOOLS_RESPONSE),
+    ):
+        mlflow.mistral.autolog()
+        client = Mistral(api_key="test_key")
+        client.chat.complete(**DUMMY_CHAT_COMPLETION_WITH_TOOLS_REQUEST)
 
     traces = get_traces()
     assert len(traces) == 1
@@ -211,47 +236,7 @@ def test_chat_complete_autolog_tool_calling(mock_complete):
     assert span.span_type == SpanType.CHAT_MODEL
     assert span.inputs == DUMMY_CHAT_COMPLETION_WITH_TOOLS_REQUEST
     assert span.outputs == DUMMY_CHAT_COMPLETION_WITH_TOOLS_RESPONSE.model_dump()
-
-    assert span.get_attribute(SpanAttributeKey.CHAT_MESSAGES) == [
-        {
-            "role": "user",
-            "content": "What's the weather like in San Francisco?",
-            "tool_calls": None,
-            "tool_call_id": None,
-        },
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "get_unit",
-                        "arguments": '"{\\"location\\": \\"San Francisco\\"}"',
-                    },
-                    "id": "tool_123",
-                    "type": "function",
-                }
-            ],
-            "tool_call_id": None,
-        },
-        {"role": "tool", "content": "celsius", "tool_call_id": "tool_123", "tool_calls": None},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "function": {
-                        "name": "get_weather",
-                        "arguments": '"{\\"location\\": \\"San Francisco\\", '
-                        '\\"unit\\": \\"celsius\\"}"',
-                    },
-                    "id": "tool_456",
-                    "type": "function",
-                }
-            ],
-            "tool_call_id": None,
-        },
-    ]
+    assert span.model_name == "test_model"
 
     assert span.get_attribute(SpanAttributeKey.CHAT_TOOLS) == [
         {
@@ -294,3 +279,39 @@ def test_chat_complete_autolog_tool_calling(mock_complete):
             },
         },
     ]
+    assert span.get_attribute(SpanAttributeKey.MESSAGE_FORMAT) == "mistral"
+    assert traces[0].info.token_usage == {
+        TokenUsageKey.INPUT_TOKENS: 11,
+        TokenUsageKey.OUTPUT_TOKENS: 19,
+        TokenUsageKey.TOTAL_TOKENS: 30,
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_complete_async_autolog():
+    with patch(
+        CHAT_DO_REQUEST_ASYNC_PATH,
+        return_value=_make_httpx_response(DUMMY_CHAT_COMPLETION_RESPONSE),
+    ):
+        mlflow.mistral.autolog()
+        client = Mistral(api_key="test_key")
+        await client.chat.complete_async(**DUMMY_CHAT_COMPLETION_REQUEST)
+
+    traces = get_traces()
+    assert len(traces) == 1
+    span = traces[0].data.spans[0]
+    assert span.name == "Chat.complete_async"
+    assert span.span_type == SpanType.CHAT_MODEL
+    assert span.inputs == DUMMY_CHAT_COMPLETION_REQUEST
+    span.outputs["usage"] = {
+        key: span.outputs["usage"][key]
+        for key in ["prompt_tokens", "completion_tokens", "total_tokens"]
+    }
+    assert span.outputs == DUMMY_CHAT_COMPLETION_RESPONSE.model_dump()
+    assert span.model_name == "test_model"
+    assert span.get_attribute(SpanAttributeKey.MESSAGE_FORMAT) == "mistral"
+    assert traces[0].info.token_usage == {
+        TokenUsageKey.INPUT_TOKENS: 10,
+        TokenUsageKey.OUTPUT_TOKENS: 18,
+        TokenUsageKey.TOTAL_TOKENS: 28,
+    }

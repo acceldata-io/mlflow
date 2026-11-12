@@ -1,11 +1,14 @@
 import { TableSkeleton, useDesignSystemTheme } from '@databricks/design-system';
-import { ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSelector } from 'react-redux';
-import type { KeyValueEntity, MetricEntitiesByName, ChartSectionConfig, ImageEntity } from '../../types';
+import type { MetricEntitiesByName, ChartSectionConfig, ImageEntity } from '../../types';
+import type { KeyValueEntity } from '../../../common/types';
 import { RunsChartsCardConfig } from '../runs-charts/runs-charts.types';
-import { RunsChartType, type SerializedRunsChartsCardConfigCard } from '../runs-charts/runs-charts.types';
+import type { RunsChartType } from '../runs-charts/runs-charts.types';
+import { type SerializedRunsChartsCardConfigCard } from '../runs-charts/runs-charts.types';
 import { RunsChartsConfigureModal } from '../runs-charts/components/RunsChartsConfigureModal';
-import { isEmptyChartCard, type RunsChartsRunData } from '../runs-charts/components/RunsCharts.common';
+import { createEmptyChartCardPredicate, type RunsChartsRunData } from '../runs-charts/components/RunsCharts.common';
 import {
   AUTOML_EVALUATION_METRIC_TAG,
   LOG_IMAGE_TAG_INDICATOR,
@@ -19,7 +22,7 @@ import {
   RUNS_VISIBILITY_MODE,
   type RunsChartsGlobalLineChartConfig,
 } from '../experiment-page/models/ExperimentPageUIState';
-import { RunRowType } from '../experiment-page/utils/experimentPage.row-types';
+import type { RunRowType } from '../experiment-page/utils/experimentPage.row-types';
 import { RunsChartsSectionAccordion } from '../runs-charts/components/sections/RunsChartsSectionAccordion';
 import type { ReduxState } from '@mlflow/mlflow/src/redux-types';
 import { SearchIcon } from '@databricks/design-system';
@@ -28,7 +31,6 @@ import { useIntl } from 'react-intl';
 import {
   type RunsGroupByConfig,
   getRunGroupDisplayName,
-  isRemainingRunsGroup,
   normalizeRunsGroupByKey,
 } from '../experiment-page/utils/experimentPage.group-row-utils';
 import { keyBy, values } from 'lodash';
@@ -64,6 +66,7 @@ export interface RunsCompareProps {
   globalLineChartConfig?: RunsChartsGlobalLineChartConfig;
   chartsSearchFilter?: string;
   storageKey: string;
+  minWidth: number;
 }
 
 /**
@@ -147,6 +150,7 @@ const RunsCompareImpl = ({
   hideEmptyCharts,
   globalLineChartConfig,
   chartsSearchFilter,
+  minWidth,
 }: RunsCompareProps) => {
   // Updater function for the general experiment view UI state
   const updateUIState = useUpdateExperimentViewUIState();
@@ -229,23 +233,10 @@ const RunsCompareImpl = ({
     }
 
     const groupChartDataEntries = comparedRuns
-      .filter((run) => run.groupParentInfo && !isRemainingRunsGroup(run.groupParentInfo))
+      .filter((run) => run.groupParentInfo)
       .map<RunsChartsRunData>((group) => createGroupDataTrace(group, getRunColor(group.groupParentInfo?.groupId)));
 
-    const remainingRuns = comparedRuns
-      .filter((run) => !run.groupParentInfo && !run.runDateAndNestInfo?.belongsToGroup)
-      .map((run) =>
-        createRunDataTrace(
-          run,
-          latestMetricsByRunUuid,
-          paramsByRunUuid,
-          tagsByRunUuid,
-          imagesByRunUuid,
-          getRunColor(run.runUuid),
-        ),
-      );
-
-    return [...groupChartDataEntries, ...remainingRuns];
+    return groupChartDataEntries;
   }, [groupBy, comparedRuns, latestMetricsByRunUuid, paramsByRunUuid, tagsByRunUuid, imagesByRunUuid, getRunColor]);
 
   const filteredImageData = chartData.filter((run) => !run.hidden && run.tags[LOG_IMAGE_TAG_INDICATOR]);
@@ -317,7 +308,8 @@ const RunsCompareImpl = ({
   const toggleRunVisibility = useToggleRowVisibilityCallback(comparedRuns);
 
   const onHideRun = useCallback(
-    (runUuid: string) => toggleRunVisibility(RUNS_VISIBILITY_MODE.CUSTOM, runUuid),
+    (runUuid: string, isCurrentlyVisible: boolean) =>
+      toggleRunVisibility(RUNS_VISIBILITY_MODE.CUSTOM, runUuid, isCurrentlyVisible),
     [toggleRunVisibility],
   );
 
@@ -357,7 +349,8 @@ const RunsCompareImpl = ({
   // If using draggable grid layout, already filter out charts that are empty or deleted
   const visibleChartCards = useMemo(() => {
     if (hideEmptyCharts) {
-      return compareRunCharts?.filter((chartCard) => !chartCard.deleted && !isEmptyChartCard(chartData, chartCard));
+      const isEmptyChartCard = createEmptyChartCardPredicate(chartData);
+      return compareRunCharts?.filter((chartCard) => !chartCard.deleted && !isEmptyChartCard(chartCard));
     }
     return compareRunCharts?.filter((chartCard) => !chartCard.deleted);
   }, [chartData, compareRunCharts, hideEmptyCharts]);
@@ -385,7 +378,7 @@ const RunsCompareImpl = ({
         overflowY: 'auto' as const,
 
         // Make sure charts are visible even on small screens
-        minWidth: 320,
+        minWidth,
       }}
       data-testid="experiment-view-compare-runs-chart-area"
     >
@@ -433,6 +426,7 @@ const RunsCompareImpl = ({
             autoRefreshEnabled={autoRefreshEnabled}
             hideEmptyCharts={hideEmptyCharts}
             globalLineChartConfig={globalLineChartConfig}
+            useMetricDisplayName={false}
           />
         </RunsChartsDraggableCardsGridContextProvider>
       </RunsChartsTooltipWrapper>

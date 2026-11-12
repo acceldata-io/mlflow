@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Generator, Optional, Sequence, Union
+from typing import Any, Generator, Sequence
 from uuid import uuid4
 
 from langchain_core.language_models import LanguageModelLike
@@ -10,7 +10,6 @@ from langchain_core.runnables import RunnableConfig, RunnableLambda
 from langchain_core.tools import BaseTool, tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
-from langgraph.graph.graph import CompiledGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
@@ -29,19 +28,17 @@ class FakeOpenAI(ChatOpenAI, extra="allow"):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._responses = iter(
-            [
-                AIMessage(
-                    content="",
-                    tool_calls=[ToolCall(name="uc_tool_format", args={}, id="123")],
-                ),
-                AIMessage(
-                    content="",
-                    tool_calls=[ToolCall(name="lc_tool_format", args={}, id="456")],
-                ),
-                AIMessage(content="Successfully generated", id="789"),
-            ]
-        )
+        self._responses = iter([
+            AIMessage(
+                content="",
+                tool_calls=[ToolCall(name="uc_tool_format", args={}, id="123")],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[ToolCall(name="lc_tool_format", args={}, id="456")],
+            ),
+            AIMessage(content="Successfully generated", id="789"),
+        ])
 
     def _generate(self, *args, **kwargs):
         return ChatResult(generations=[ChatGeneration(message=next(self._responses))])
@@ -50,13 +47,11 @@ class FakeOpenAI(ChatOpenAI, extra="allow"):
 @tool
 def uc_tool_format() -> str:
     """Returns uc tool format"""
-    return json.dumps(
-        {
-            "format": "SCALAR",
-            "value": '{"content":"hi","attachments":{"a":"b"},"custom_outputs":{"c":"d"}}',
-            "truncated": False,
-        }
-    )
+    return json.dumps({
+        "format": "SCALAR",
+        "value": '{"content":"hi","attachments":{"a":"b"},"custom_outputs":{"c":"d"}}',
+        "truncated": False,
+    })
 
 
 @tool
@@ -75,9 +70,9 @@ tools = [uc_tool_format, lc_tool_format]
 
 def create_tool_calling_agent(
     model: LanguageModelLike,
-    tools: Union[ToolNode, Sequence[BaseTool]],
-    agent_prompt: Optional[str] = None,
-) -> CompiledGraph:
+    tools: ToolNode | Sequence[BaseTool],
+    agent_prompt: str | None = None,
+) -> CompiledStateGraph:
     model = model.bind_tools(tools)
 
     def should_continue(state: ChatAgentState):
@@ -141,13 +136,13 @@ class LangGraphChatAgent(ChatAgent):
     def predict(
         self,
         messages: list[ChatAgentMessage],
-        context: Optional[ChatContext] = None,
-        custom_inputs: Optional[dict[str, Any]] = None,
+        context: ChatContext | None = None,
+        custom_inputs: dict[str, Any] | None = None,
     ) -> ChatAgentResponse:
         request = {
             "messages": self._convert_messages_to_dict(messages),
             **({"custom_inputs": custom_inputs} if custom_inputs else {}),
-            **({"context": context.model_dump_compat()} if context else {}),
+            **({"context": context.model_dump()} if context else {}),
         }
 
         response = ChatAgentResponse(messages=[])
@@ -164,13 +159,13 @@ class LangGraphChatAgent(ChatAgent):
     def predict_stream(
         self,
         messages: list[ChatAgentMessage],
-        context: Optional[ChatContext] = None,
-        custom_inputs: Optional[dict[str, Any]] = None,
+        context: ChatContext | None = None,
+        custom_inputs: dict[str, Any] | None = None,
     ) -> Generator[ChatAgentChunk, None, None]:
         request = {
             "messages": self._convert_messages_to_dict(messages),
             **({"custom_inputs": custom_inputs} if custom_inputs else {}),
-            **({"context": context.model_dump_compat()} if context else {}),
+            **({"context": context.model_dump()} if context else {}),
         }
 
         last_message = None

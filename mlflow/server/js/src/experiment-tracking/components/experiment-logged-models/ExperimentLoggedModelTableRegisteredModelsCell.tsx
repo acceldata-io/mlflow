@@ -1,21 +1,29 @@
-import { GraphQLExperimentRun, LoggedModelProto } from '../../types';
+import type { LoggedModelProto } from '../../types';
+import { GraphQLExperimentRun } from '../../types';
 import { Link } from '../../../common/utils/RoutingUtils';
 import { useExperimentLoggedModelRegisteredVersions } from './hooks/useExperimentLoggedModelRegisteredVersions';
 import { isEmpty } from 'lodash';
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Overflow, Tag, useDesignSystemTheme } from '@databricks/design-system';
 import { ReactComponent as RegisteredModelOkIcon } from '../../../common/static/registered-model-grey-ok.svg';
 
 export const ExperimentLoggedModelTableRegisteredModelsCell = ({ data }: { data: LoggedModelProto }) => {
   const { theme } = useDesignSystemTheme();
-  const modelVersions = useExperimentLoggedModelRegisteredVersions({ loggedModels: [data] });
+
+  const loggedModels = useMemo(() => [data], [data]);
+
+  const { modelVersions } = useExperimentLoggedModelRegisteredVersions({ loggedModels });
 
   if (!isEmpty(modelVersions)) {
     return (
       <Overflow>
         {modelVersions.map((modelVersion) => (
           <React.Fragment key={modelVersion.link}>
-            <Link to={modelVersion.link} css={{ display: 'flex', alignItems: 'center', gap: theme.spacing.xs }}>
+            <Link
+              componentId="mlflow.logged_models.table.registered_model_link"
+              to={modelVersion.link}
+              css={{ display: 'flex', alignItems: 'center', gap: theme.spacing.xs }}
+            >
               <RegisteredModelOkIcon />
               {modelVersion.displayedName}
               <Tag

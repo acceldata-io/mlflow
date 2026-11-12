@@ -89,7 +89,7 @@ class DatabricksJobRunner:
     Helper class for running an MLflow project as a Databricks Job.
 
     Args:
-        databricks_profile: Optional Databricks CLI profile to use to fetch hostname &
+        databricks_profile_uri: Optional Databricks CLI profile to use to fetch hostname &
            authentication information when making Databricks API requests.
     """
 
@@ -155,7 +155,7 @@ class DatabricksJobRunner:
             )
         return True
 
-    def _upload_project_to_dbfs(self, project_dir, experiment_id):  # noqa: D417
+    def _upload_project_to_dbfs(self, project_dir, experiment_id):
         """
         Tars a project directory into an archive in a temp dir and uploads it to DBFS, returning
         the HDFS-style URI of the tarball in DBFS (e.g. dbfs:/path/to/tar).

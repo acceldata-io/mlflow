@@ -2,11 +2,10 @@ import functools
 import os
 import shutil
 from contextlib import contextmanager
-from typing import Optional
 
 import mlflow
 from mlflow.exceptions import MlflowException
-from mlflow.protos.unity_catalog_oss_messages_pb2 import (
+from mlflow.protos.unity_catalog_messages_pb2 import (
     READ_WRITE_MODEL_VERSION,
     CreateModelVersion,
     CreateRegisteredModel,
@@ -24,7 +23,7 @@ from mlflow.protos.unity_catalog_oss_messages_pb2 import (
     UpdateModelVersion,
     UpdateRegisteredModel,
 )
-from mlflow.protos.unity_catalog_oss_service_pb2 import UnityCatalogService
+from mlflow.protos.unity_catalog_service_pb2 import UnityCatalogService
 from mlflow.store.artifact.local_artifact_repo import LocalArtifactRepository
 from mlflow.store.entities.paged_list import PagedList
 from mlflow.store.model_registry.base_rest_store import BaseRestStore
@@ -39,7 +38,6 @@ from mlflow.utils._unity_catalog_utils import (
     get_artifact_repo_from_storage_info,
     get_full_name_from_sc,
 )
-from mlflow.utils.annotations import experimental
 from mlflow.utils.oss_registry_utils import get_oss_host_creds
 from mlflow.utils.proto_json_utils import message_to_json
 from mlflow.utils.rest_utils import (
@@ -71,7 +69,6 @@ def _require_arg_unspecified(arg_name, arg_value, default_values=None, message=N
         _raise_unsupported_arg(arg_name, message)
 
 
-@experimental(version="2.17.0")
 class UnityCatalogOssStore(BaseRestStore):
     """
     Client for an Open Source Unity Catalog Server accessed via REST API calls.
@@ -120,7 +117,7 @@ class UnityCatalogOssStore(BaseRestStore):
 
         """
         [catalog_name, schema_name, model_name] = name.split(".")
-        comment = description if description else ""
+        comment = description or ""
         # RegisteredModelInfo is inlined in the request and the response.
         # https://docs.databricks.com/api/workspace/registeredmodels/create
         # TODO: Update the above reference to UC OSS documentation when it's available
@@ -148,7 +145,7 @@ class UnityCatalogOssStore(BaseRestStore):
             A single updated :py:class:`mlflow.entities.model_registry.RegisteredModel` object.
         """
         full_name = get_full_name_from_sc(name, None)
-        comment = description if description else ""
+        comment = description or ""
         req_body = message_to_json(
             UpdateRegisteredModel(
                 full_name=full_name,
@@ -268,7 +265,7 @@ class UnityCatalogOssStore(BaseRestStore):
         run_link=None,
         description=None,
         local_model_path=None,
-        model_id: Optional[str] = None,
+        model_id: str | None = None,
     ):
         with self._local_model_dir(source, local_model_path) as local_model_dir:
             [catalog_name, schema_name, model_name] = name.split(".")
@@ -433,18 +430,18 @@ class UnityCatalogOssStore(BaseRestStore):
             is_oss=True,
         )
 
-    def _get_temporary_model_version_write_credentials_oss(  # noqa: D417
+    def _get_temporary_model_version_write_credentials_oss(
         self, model_name, catalog_name, schema_name, version
     ):
         """
         Get temporary credentials for uploading model version files
 
         Args:
-            name: Registered model name.
+            model_name: Registered model name.
             version: Model version number.
 
         Returns:
-            mlflow.protos.unity_catalog_oss_messages_pb2.TemporaryCredentials containing
+            mlflow.protos.unity_catalog_messages_pb2.TemporaryCredentials containing
             temporary model version credentials.
         """
         req_body = message_to_json(
@@ -476,7 +473,7 @@ class UnityCatalogOssStore(BaseRestStore):
                     "Unable to download model artifacts from source artifact location "
                     f"'{source}' in order to upload them to Unity Catalog. Please ensure "
                     "the source artifact location exists and that you can download from "
-                    "it via mlflow.artifacts.download_artifacts()"
+                    f"it via mlflow.artifacts.download_artifacts(). Original error: {e}"
                 ) from e
             try:
                 yield local_model_dir

@@ -1,9 +1,9 @@
-import { ColumnDef } from '@tanstack/react-table';
-import { RegisteredPrompt } from '../types';
-import { Button, PencilIcon } from '@databricks/design-system';
+import type { ColumnDef } from '@tanstack/react-table';
+import type { RegisteredPrompt } from '../types';
+import { Button, Overflow, PencilIcon, useDesignSystemTheme } from '@databricks/design-system';
 import { FormattedMessage, useIntl } from 'react-intl';
 import { isUserFacingTag } from '../../../../common/utils/TagUtils';
-import { PromptsTableMetadata } from '../utils';
+import type { PromptsTableMetadata } from '../utils';
 import { KeyValueTag } from '../../../../common/components/KeyValueTag';
 
 export const PromptsListTableTagsCell: ColumnDef<RegisteredPrompt>['cell'] = ({
@@ -13,6 +13,7 @@ export const PromptsListTableTagsCell: ColumnDef<RegisteredPrompt>['cell'] = ({
   },
 }) => {
   const intl = useIntl();
+  const { theme } = useDesignSystemTheme();
 
   const { onEditTags } = meta as PromptsTableMetadata;
 
@@ -20,12 +21,14 @@ export const PromptsListTableTagsCell: ColumnDef<RegisteredPrompt>['cell'] = ({
   const containsTags = visibleTagList.length > 0;
 
   return (
-    <div css={{ display: 'flex' }}>
-      <div css={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex' }}>
-        {visibleTagList?.map((tag) => (
-          <KeyValueTag key={tag.key} tag={tag} />
-        ))}
-      </div>
+    <div css={{ display: 'flex', alignItems: 'center' }}>
+      {containsTags && (
+        <Overflow noMargin>
+          {visibleTagList.map((tag) => (
+            <KeyValueTag key={tag.key} tag={tag} />
+          ))}
+        </Overflow>
+      )}
       <Button
         componentId="mlflow.prompts.list.tag.add"
         size="small"
@@ -45,6 +48,7 @@ export const PromptsListTableTagsCell: ColumnDef<RegisteredPrompt>['cell'] = ({
         }
         css={{
           flexShrink: 0,
+          marginLeft: containsTags ? theme.spacing.sm : 0,
           opacity: 0,
           '[role=row]:hover &': {
             opacity: 1,

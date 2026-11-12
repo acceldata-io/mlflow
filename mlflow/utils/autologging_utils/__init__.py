@@ -1,10 +1,11 @@
 import contextlib
 import importlib
+import importlib.metadata
 import inspect
 import logging
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import mlflow
 from mlflow.entities import Metric
@@ -60,25 +61,6 @@ AUTOLOGGING_CONF_KEY_IS_GLOBALLY_CONFIGURED = "globally_configured"
 # Dict mapping integration name to its config.
 AUTOLOGGING_INTEGRATIONS = {}
 
-# When the library version installed in the user's environment is outside of the supported
-# version range declared in `ml-package-versions.yml`, a warning message is issued to the user.
-# However, some libraries releases versions very frequently, and our configuration (updated on
-# MLflow release) cannot keep up with the pace, resulting in false alarms. Therefore, we
-# suppress warnings for certain libraries that are known to have frequent releases.
-_AUTOLOGGING_SUPPORTED_VERSION_WARNING_SUPPRESS_LIST = [
-    "langchain",
-    "llama_index",
-    "litellm",
-    "openai",
-    "dspy",
-    "autogen",
-    "ag2",
-    "gemini",
-    "anthropic",
-    "crewai",
-    "bedrock",
-]
-
 # Global lock for turning on / off autologging
 # Note "RLock" is required instead of plain lock, for avoid dead-lock
 _autolog_conf_global_lock = threading.RLock()
@@ -129,13 +111,11 @@ def get_mlflow_run_params_for_fn_args(fn, args, kwargs, unlogged=None):
     params_to_log.update(kwargs)
     # Add parameters that were not explicitly specified by the caller to the mapping,
     # using their default values
-    params_to_log.update(
-        {
-            param.name: param.default
-            for param in list(relevant_params)[len(args) :]
-            if param.name not in kwargs
-        }
-    )
+    params_to_log.update({
+        param.name: param.default
+        for param in list(relevant_params)[len(args) :]
+        if param.name not in kwargs
+    })
     # Filter out any parameters that should not be logged, as specified by the `unlogged` parameter
     return {key: value for key, value in params_to_log.items() if key not in unlogged}
 
@@ -245,7 +225,7 @@ def resolve_input_example_and_signature(
 class BatchMetricsLogger:
     """
     The BatchMetricsLogger will log metrics in batch against an mlflow run.
-    If run_id is passed to to constructor then all recording and logging will
+    If run_id is passed to constructor then all recording and logging will
     happen against that run_id.
     If no run_id is passed into constructor, then the run ID will be fetched
     from `mlflow.active_run()` each time `record_metrics()` or `flush()` is called; in this
@@ -331,7 +311,7 @@ class BatchMetricsLogger:
 
 
 @contextlib.contextmanager
-def batch_metrics_logger(run_id: Optional[str] = None, model_id: Optional[str] = None):
+def batch_metrics_logger(run_id: str | None = None, model_id: str | None = None):
     """
     Context manager that yields a BatchMetricsLogger object, which metrics can be logged against.
     The BatchMetricsLogger keeps metrics in a list until it decides they should be logged, at
@@ -373,24 +353,31 @@ def gen_autologging_package_version_requirements_doc(integration_name):
 
 def _check_and_log_warning_for_unsupported_package_versions(integration_name):
     """
-    When autologging is enabled and `disable_for_unsupported_versions=False` for the specified
-    autologging integration, check whether the currently-installed versions of the integration's
-    associated package versions are supported by the specified integration. If the package versions
-    are not supported, log a warning message.
+    If the package version is not supported for autologging, log a warning message.
+
+    Only check the minimum version, not the maximum version. This is because the "maximum" version
+    in the ml-package-versions.yml is only updated per release and it cannot keep up with the pace
+    of the package releases. The cross-version tests in MLflow CI runs tests against the latest
+    available version, not limited to the "maximum" version, so it is safe to assume it supports
+    up to the latest version.
     """
     if (
         integration_name in FLAVOR_TO_MODULE_NAME
-        and integration_name not in _AUTOLOGGING_SUPPORTED_VERSION_WARNING_SUPPRESS_LIST
         and not get_autologging_config(integration_name, "disable", True)
         and not get_autologging_config(integration_name, "disable_for_unsupported_versions", False)
-        and not is_flavor_supported_for_associated_package_versions(integration_name)
+        and not is_flavor_supported_for_associated_package_versions(
+            integration_name, check_max_version=False
+        )
     ):
-        min_var, max_var, pip_release = get_min_max_version_and_pip_release(integration_name)
+        min_var, _, pip_release = get_min_max_version_and_pip_release(integration_name)
         module = importlib.import_module(FLAVOR_TO_MODULE_NAME[integration_name])
+        installed_version = getattr(module, "__version__", None) or importlib.metadata.version(
+            pip_release
+        )
         _logger.warning(
             f"MLflow {integration_name} autologging is known to be compatible with "
-            f"{min_var} <= {pip_release} <= {max_var}, but the installed version is "
-            f"{module.__version__}. If you encounter errors during autologging, try upgrading "
+            f"{min_var} <= {pip_release}, but the installed version is {installed_version}. "
+            "If you encounter errors during autologging, try upgrading "
             f"/ downgrading {pip_release} to a compatible version, or try upgrading MLflow.",
         )
 
@@ -426,9 +413,9 @@ def autologging_integration(name):
         @autologging_conf_lock
         def autolog(*args, **kwargs):
             config_to_store = dict(default_params)
-            config_to_store.update(
-                {param.name: arg for arg, param in zip(args, param_spec.values())}
-            )
+            config_to_store.update({
+                param.name: arg for arg, param in zip(args, param_spec.values())
+            })
             config_to_store.update(kwargs)
             AUTOLOGGING_INTEGRATIONS[name] = config_to_store
 
@@ -544,7 +531,7 @@ def is_autolog_supported(integration_name: str) -> bool:
     return "autologging" in _ML_PACKAGE_VERSIONS.get(integration_name, {})
 
 
-def get_autolog_function(integration_name: str) -> Optional[Callable[..., Any]]:
+def get_autolog_function(integration_name: str) -> Callable[..., Any] | None:
     """
     Get the autolog() function for the specified integration.
     Returns None if the flavor does not have an autolog() function.

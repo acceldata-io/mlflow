@@ -1,21 +1,22 @@
 ---
+title: Tracing DSPy🧩
+description: Trace DSPy modular AI system pipelines and prompt optimization with MLflow for full observability into programmatic LLM workflows.
 sidebar_position: 5
 sidebar_label: DSPy
+keywords: [dspy, tracing, mlflow, prompt optimization, modular ai, llm]
 ---
 
+import useBaseUrl from '@docusaurus/useBaseUrl';
+
 import { APILink } from "@site/src/components/APILink";
-import { Card, CardGroup, SmallLogoCard } from "@site/src/components/Card";
-import TOCInline from "@theme/TOCInline";
-import Tabs from "@theme/Tabs";
-import TabItem from "@theme/TabItem";
 
 # Tracing DSPy🧩
 
-![DSPy Tracing via autolog](/images/llms/tracing/dspy-tracing.gif)
+<video src={useBaseUrl("/images/llms/tracing/dspy-tracing.mp4")} controls loop autoPlay muted aria-label="DSPy Tracing via autolog" />
 
 [DSPy](https://dspy.ai/) is an open-source framework for building modular AI systems and offers algorithms for optimizing their prompts and weights.
 
-[MLflow Tracing](../) provides automatic tracing capability for DSPy. You can enable tracing
+[MLflow Tracing](../../) provides automatic tracing capability for DSPy. You can enable tracing
 for DSPy by calling the <APILink fn="mlflow.dspy.autolog" /> function, and nested traces are automatically logged to the active MLflow Experiment upon invocation of DSPy modules.
 
 ```python
@@ -29,7 +30,6 @@ mlflow.dspy.autolog()
 MLflow DSPy integration is not only about tracing. MLflow offers full tracking experience for DSPy, including model tracking, index management, and evaluation. Please see the **[MLflow DSPy Flavor](/genai/flavors/dspy)** to learn more!
 
 :::
-
 
 ### Example Usage
 
@@ -68,7 +68,7 @@ class Summarize(dspy.Module):
 summarizer = Summarize()
 summarizer(
     passage=(
-        "MLflow Tracing is a feature that enhances LLM observability in your Generative AI (GenAI) applications "
+        "MLflow Tracing is a feature that enhances LLM observability in your LLM applications and AI agents "
         "by capturing detailed information about the execution of your application's services. Tracing provides "
         "a way to record the inputs, outputs, and metadata associated with each intermediate step of a request, "
         "enabling you to easily pinpoint the source of bugs and unexpected behaviors."
@@ -93,24 +93,22 @@ mlflow.dspy.autolog(log_traces_from_eval=True)
 
 # Define a simple evaluation set
 eval_set = [
-    dspy.Example(
-        question="How many 'r's are in the word 'strawberry'?", answer="3"
-    ).with_inputs("question"),
-    dspy.Example(
-        question="How many 'a's are in the word 'banana'?", answer="3"
-    ).with_inputs("question"),
-    dspy.Example(
-        question="How many 'e's are in the word 'elephant'?", answer="2"
-    ).with_inputs("question"),
+    dspy.Example(question="How many 'r's are in the word 'strawberry'?", answer="3").with_inputs(
+        "question"
+    ),
+    dspy.Example(question="How many 'a's are in the word 'banana'?", answer="3").with_inputs(
+        "question"
+    ),
+    dspy.Example(question="How many 'e's are in the word 'elephant'?", answer="2").with_inputs(
+        "question"
+    ),
 ]
 
 
 # Define a program
 class Counter(dspy.Signature):
     question: str = dspy.InputField()
-    answer: str = dspy.OutputField(
-        desc="Should only contain a single number as an answer"
-    )
+    answer: str = dspy.OutputField(desc="Should only contain a single number as an answer")
 
 
 cot = dspy.ChainOfThought(Counter)
@@ -139,8 +137,7 @@ with mlflow.start_run(run_name="CoT Evaluation"):
     )
 ```
 
-If you open the MLflow UI and go to the "CoT Evaluation" run, you will see the evaluation result, and the list of traces generated during the evaluation on the ``Traces`` tab.
-
+If you open the MLflow UI and go to the "CoT Evaluation" run, you will see the evaluation result, and the list of traces generated during the evaluation on the `Traces` tab.
 
 :::note
 
@@ -166,6 +163,14 @@ tp = dspy.MIPROv2(metric=metric, auto="medium", num_threads=24)
 optimized = tp.compile(cot, trainset=trainset)
 ```
 
+### Token Usage
+
+MLflow automatically tracks token usage for DSPy. See the [Token Usage and Cost Tracking](/genai/tracing/token-usage-cost) documentation for details on accessing this information programmatically.
+
+:::note
+Cost tracking is not currently supported for DSPy because the model name may not be available in the span attributes.
+:::
+
 ### Disable auto-tracing
 
-Auto tracing for LlamaIndex can be disabled globally by calling `mlflow.llama_index.autolog(disable=True)` or `mlflow.autolog(disable=True)`.
+Auto tracing for DSPy can be disabled globally by calling `mlflow.dspy.autolog(disable=True)` or `mlflow.autolog(disable=True)`.

@@ -1,7 +1,7 @@
 import json
 import os
-from collections import namedtuple
 from pathlib import Path
+from typing import Any, NamedTuple
 from unittest import mock
 
 import catboost as cb
@@ -39,7 +39,10 @@ EXTRA_PYFUNC_SERVING_TEST_ARGS = (
     [] if _is_available_on_pypi("catboost") else ["--env-manager", "local"]
 )
 
-ModelWithData = namedtuple("ModelWithData", ["model", "inference_dataframe"])
+
+class ModelWithData(NamedTuple):
+    model: Any
+    inference_dataframe: Any
 
 
 def get_iris():
@@ -87,12 +90,10 @@ def reg_model():
 
 def get_reg_model_signature():
     return ModelSignature(
-        inputs=Schema(
-            [
-                ColSpec(name="sepal length (cm)", type=DataType.double),
-                ColSpec(name="sepal width (cm)", type=DataType.double),
-            ]
-        ),
+        inputs=Schema([
+            ColSpec(name="sepal length (cm)", type=DataType.double),
+            ColSpec(name="sepal width (cm)", type=DataType.double),
+        ]),
         outputs=Schema([ColSpec(type=DataType.double)]),
     )
 
@@ -455,7 +456,10 @@ def test_pyfunc_serve_and_score_sklearn(reg_model):
 
     with mlflow.start_run():
         model_info = mlflow.sklearn.log_model(
-            model, name="model", input_example=inference_dataframe.head(3)
+            model,
+            name="model",
+            input_example=inference_dataframe.head(3),
+            skops_trusted_types=["catboost.core.CatBoostRegressor"],
         )
 
     inference_payload = load_serving_example(model_info.model_uri)
@@ -522,12 +526,10 @@ def test_model_log_with_signature_inference(cb_model):
         )
 
     loaded_model_info = Model.load(model_info.model_uri)
-    assert loaded_model_info.signature.inputs == Schema(
-        [
-            ColSpec(name="sepal length (cm)", type=DataType.double),
-            ColSpec(name="sepal width (cm)", type=DataType.double),
-        ]
-    )
+    assert loaded_model_info.signature.inputs == Schema([
+        ColSpec(name="sepal length (cm)", type=DataType.double),
+        ColSpec(name="sepal width (cm)", type=DataType.double),
+    ])
     assert loaded_model_info.signature.outputs in [
         # when the model output is a 1D numpy array, it is cast into a `ColSpec`
         Schema([ColSpec(type=DataType.double)]),

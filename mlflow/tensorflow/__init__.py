@@ -13,7 +13,7 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas
@@ -26,6 +26,7 @@ from mlflow.data.code_dataset_source import CodeDatasetSource
 from mlflow.data.numpy_dataset import from_numpy
 from mlflow.data.tensorflow_dataset import from_tensorflow
 from mlflow.entities import LoggedModelInput
+from mlflow.environment_variables import MLFLOW_ALLOW_PICKLE_DESERIALIZATION
 from mlflow.exceptions import INVALID_PARAMETER_VALUE, MlflowException
 from mlflow.models import Model, ModelInputExample, ModelSignature, infer_signature
 from mlflow.models.model import MLMODEL_FILE_NAME
@@ -35,7 +36,7 @@ from mlflow.tensorflow.callback import MlflowCallback, MlflowModelCheckpointCall
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.tracking.context import registry as context_registry
-from mlflow.tracking.fluent import _shut_down_async_logging
+from mlflow.tracking.fluent import _initialize_logged_model, _shut_down_async_logging
 from mlflow.types.schema import TensorSpec
 from mlflow.utils import is_iterator
 from mlflow.utils.autologging_utils import (
@@ -49,6 +50,10 @@ from mlflow.utils.autologging_utils import (
 from mlflow.utils.checkpoint_utils import (
     _WEIGHT_ONLY_CHECKPOINT_SUFFIX,
     download_checkpoint_artifact,
+)
+from mlflow.utils.databricks_utils import (
+    is_in_databricks_model_serving_environment,
+    is_in_databricks_runtime,
 )
 from mlflow.utils.docstring_utils import LOG_MODEL_PARAM_DOCS, format_docstring
 from mlflow.utils.environment import (
@@ -65,6 +70,7 @@ from mlflow.utils.environment import (
 from mlflow.utils.file_utils import TempDir, get_total_file_size, write_to
 from mlflow.utils.model_utils import (
     _add_code_from_conf_to_system_path,
+    _copy_extra_files,
     _get_flavor_configuration,
     _validate_and_copy_code_paths,
     _validate_and_prepare_target_save_path,
@@ -140,7 +146,7 @@ def get_global_custom_objects():
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name=FLAVOR_NAME))
 def log_model(
     model,
-    artifact_path: Optional[str] = None,
+    artifact_path: str | None = None,
     custom_objects=None,
     conda_env=None,
     code_paths=None,
@@ -153,12 +159,14 @@ def log_model(
     saved_model_kwargs=None,
     keras_model_kwargs=None,
     metadata=None,
-    name: Optional[str] = None,
-    params: Optional[dict[str, Any]] = None,
-    tags: Optional[dict[str, Any]] = None,
-    model_type: Optional[str] = None,
+    extra_files=None,
+    name: str | None = None,
+    params: dict[str, Any] | None = None,
+    tags: dict[str, Any] | None = None,
+    model_type: str | None = None,
     step: int = 0,
-    model_id: Optional[str] = None,
+    model_id: str | None = None,
+    **kwargs,
 ):
     """
     Log a TF2 core model (inheriting tf.Module) or a Keras model in MLflow Model format.
@@ -180,12 +188,10 @@ def log_model(
             from mlflow.models import ModelSignature
             import numpy as np
 
-            input_schema = Schema(
-                [
-                    TensorSpec(np.dtype(np.uint64), (-1, 5), "field1"),
-                    TensorSpec(np.dtype(np.float32), (-1, 3, 2), "field2"),
-                ]
-            )
+            input_schema = Schema([
+                TensorSpec(np.dtype(np.uint64), (-1, 5), "field1"),
+                TensorSpec(np.dtype(np.float32), (-1, 3, 2), "field2"),
+            ])
             # Create the signature for a model that requires 2 inputs:
             #  - Input with name "field1", shape (-1, 5), type "np.uint64"
             #  - Input with name "field2", shape (-1, 3, 2), type "np.float32"
@@ -214,12 +220,14 @@ def log_model(
         saved_model_kwargs: a dict of kwargs to pass to ``tensorflow.saved_model.save`` method.
         keras_model_kwargs: a dict of kwargs to pass to ``keras_model.save`` method.
         metadata: {{ metadata }}
+        extra_files: {{ extra_files }}
         name: {{ name }}
         params: {{ params }}
         tags: {{ tags }}
         model_type: {{ model_type }}
         step: {{ step }}
         model_id: {{ model_id }}
+        kwargs: Extra arguments to pass to :py:func:`mlflow.models.Model.log`.
 
     Returns
         A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
@@ -243,11 +251,13 @@ def log_model(
         saved_model_kwargs=saved_model_kwargs,
         keras_model_kwargs=keras_model_kwargs,
         metadata=metadata,
+        extra_files=extra_files,
         params=params,
         tags=tags,
         model_type=model_type,
         step=step,
         model_id=model_id,
+        **kwargs,
     )
 
 
@@ -295,6 +305,7 @@ def save_model(
     saved_model_kwargs=None,
     keras_model_kwargs=None,
     metadata=None,
+    extra_files=None,
 ):
     """
     Save a TF2 core model (inheriting tf.Module) or Keras model in MLflow Model format to a path on
@@ -315,12 +326,10 @@ def save_model(
             from mlflow.models import ModelSignature
             import numpy as np
 
-            input_schema = Schema(
-                [
-                    TensorSpec(np.dtype(np.uint64), (-1, 5), "field1"),
-                    TensorSpec(np.dtype(np.float32), (-1, 3, 2), "field2"),
-                ]
-            )
+            input_schema = Schema([
+                TensorSpec(np.dtype(np.uint64), (-1, 5), "field1"),
+                TensorSpec(np.dtype(np.float32), (-1, 3, 2), "field2"),
+            ])
             # Create the signature for a model that requires 2 inputs:
             #  - Input with name "field1", shape (-1, 5), type "np.uint64"
             #  - Input with name "field2", shape (-1, 3, 2), type "np.float32"
@@ -346,6 +355,7 @@ def save_model(
         keras_model_kwargs: a dict of kwargs to pass to ``model.save`` method if the model
             to be saved is a keras model.
         metadata: {{ metadata }}
+        extra_files: {{ extra_files }}
     """
     import tensorflow as tf
     from tensorflow.keras.models import Model as KerasModel
@@ -476,8 +486,12 @@ def save_model(
     else:
         raise MlflowException(f"Unknown model type: {type(model)}")
 
+    extra_files_config = _copy_extra_files(extra_files, path)
+
     # update flavor info to mlflow_model
-    mlflow_model.add_flavor(FLAVOR_NAME, code=code_dir_subpath, **flavor_options)
+    mlflow_model.add_flavor(
+        FLAVOR_NAME, code=code_dir_subpath, **flavor_options, **extra_files_config
+    )
 
     # append loader_module, data and env data to mlflow_model
     pyfunc.add_to_model(
@@ -535,6 +549,16 @@ def _load_custom_objects(path, file_name):
         if os.path.isfile(os.path.join(path, file_name)):
             custom_objects_path = os.path.join(path, file_name)
     if custom_objects_path is not None:
+        if (
+            not MLFLOW_ALLOW_PICKLE_DESERIALIZATION.get()
+            and not is_in_databricks_runtime()
+            and not is_in_databricks_model_serving_environment()
+        ):
+            raise MlflowException(
+                "Deserializing custom objects using cloudpickle is disallowed, but this model "
+                "was saved with custom objects in pickle format. To address this issue, you need "
+                "to set environment variable 'MLFLOW_ALLOW_PICKLE_DESERIALIZATION' to 'true'."
+            )
         import cloudpickle
 
         with open(custom_objects_path, "rb") as f:
@@ -791,7 +815,7 @@ class _TF2Wrapper:
     def predict(
         self,
         data,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ):
         """
         Args:
@@ -850,7 +874,7 @@ class _TF2ModuleWrapper:
     def predict(
         self,
         data,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ):
         """
         Args:
@@ -889,7 +913,7 @@ class _KerasModelWrapper:
     def predict(
         self,
         data,
-        params: Optional[dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
     ):
         """
         Args:
@@ -1122,7 +1146,7 @@ def autolog(
             the model is considered the "best" model according to the quantity
             monitored and previous checkpoint model is overwritten.
         checkpoint_save_weights_only: In automatic model checkpointing, if True, then
-            only the model’s weights will be saved. Otherwise, the optimizer states,
+            only the model's weights will be saved. Otherwise, the optimizer states,
             lr-scheduler states, etc are added in the checkpoint too.
         checkpoint_save_freq: `"epoch"` or integer. When using `"epoch"`, the callback
             saves the model after each epoch. When using integer, the callback
@@ -1328,7 +1352,7 @@ def autolog(
 
             model_id = None
             if log_models:
-                model_id = mlflow.initialize_logged_model("model").model_id
+                model_id = _initialize_logged_model("model", flavor=FLAVOR_NAME).model_id
 
             if log_datasets:
                 try:

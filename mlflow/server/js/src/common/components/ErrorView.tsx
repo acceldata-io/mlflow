@@ -4,7 +4,8 @@ import error404Img from '../static/404-overflow.svg';
 import Routes from '../../experiment-tracking/routes';
 import { Link } from '../utils/RoutingUtils';
 import { FormattedMessage } from 'react-intl';
-import { DesignSystemHocProps, WithDesignSystemThemeHoc } from '@databricks/design-system';
+import type { DesignSystemHocProps } from '@databricks/design-system';
+import { WithDesignSystemThemeHoc } from '@databricks/design-system';
 
 const altMessages: Record<number, string> = {
   400: '400 Bad Request',
@@ -26,11 +27,13 @@ function ErrorImage(props: ErrorImageProps) {
 
   switch (props.statusCode) {
     case 404:
-      return <img className="center" alt={alt} style={{ height: '300px', marginTop: '80px' }} src={error404Img} />;
+      return (
+        <img className="mlflow-center" alt={alt} style={{ height: '300px', marginTop: '80px' }} src={error404Img} />
+      );
     default:
       return (
         <img
-          className="center"
+          className="mlflow-center"
           alt={alt}
           src={errorDefaultImg}
           style={{
@@ -46,6 +49,7 @@ type ErrorViewImplProps = DesignSystemHocProps & {
   statusCode: number;
   subMessage?: string;
   fallbackHomePageReactRoute?: string;
+  disableWorkspacePrefixOnFallback?: boolean;
 };
 
 class ErrorViewImpl extends Component<ErrorViewImplProps> {
@@ -55,7 +59,11 @@ class ErrorViewImpl extends Component<ErrorViewImplProps> {
     409: 'Resource Conflict',
   };
 
-  renderErrorMessage(subMessage?: string, fallbackHomePageReactRoute?: string) {
+  renderErrorMessage(
+    subMessage?: string,
+    fallbackHomePageReactRoute?: string,
+    disableWorkspacePrefixOnFallback?: boolean,
+  ) {
     if (subMessage) {
       return (
         <FormattedMessage
@@ -63,7 +71,12 @@ class ErrorViewImpl extends Component<ErrorViewImplProps> {
           description="Default error message for error views in MLflow"
           values={{
             link: (chunks) => (
-              <Link data-testid="error-view-link" to={fallbackHomePageReactRoute || Routes.rootRoute}>
+              <Link
+                data-testid="error-view-link"
+                componentId="mlflow.common.error_view.fallback_link"
+                to={fallbackHomePageReactRoute || Routes.rootRoute}
+                disableWorkspacePrefix={disableWorkspacePrefixOnFallback}
+              >
                 {chunks}
               </Link>
             ),
@@ -78,7 +91,12 @@ class ErrorViewImpl extends Component<ErrorViewImplProps> {
           description="Default error message for error views in MLflow"
           values={{
             link: (chunks) => (
-              <Link data-testid="error-view-link" to={fallbackHomePageReactRoute || Routes.rootRoute}>
+              <Link
+                data-testid="error-view-link"
+                componentId="mlflow.common.error_view.fallback_link"
+                to={fallbackHomePageReactRoute || Routes.rootRoute}
+                disableWorkspacePrefix={disableWorkspacePrefixOnFallback}
+              >
                 {chunks}
               </Link>
             ),
@@ -89,15 +107,21 @@ class ErrorViewImpl extends Component<ErrorViewImplProps> {
   }
 
   render() {
-    const { statusCode, subMessage, fallbackHomePageReactRoute, designSystemThemeApi } = this.props;
+    const {
+      statusCode,
+      subMessage,
+      fallbackHomePageReactRoute,
+      disableWorkspacePrefixOnFallback,
+      designSystemThemeApi,
+    } = this.props;
     const centerMessage = ErrorViewImpl.centerMessages[statusCode] || 'HTTP Request Error';
 
     return (
-      <div className="center">
+      <div className="mlflow-center">
         <ErrorImage statusCode={statusCode} />
         <h1 style={{ paddingTop: '10px' }}>{centerMessage}</h1>
         <h2 style={{ color: designSystemThemeApi.theme.colors.textSecondary }}>
-          {this.renderErrorMessage(subMessage, fallbackHomePageReactRoute)}
+          {this.renderErrorMessage(subMessage, fallbackHomePageReactRoute, disableWorkspacePrefixOnFallback)}
         </h2>
       </div>
     );

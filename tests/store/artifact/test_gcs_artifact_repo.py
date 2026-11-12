@@ -117,7 +117,7 @@ def test_list_artifacts_with_subdir(mock_client, dir_name):
 
 
 def test_log_artifact(mock_client, tmp_path):
-    repo = GCSArtifactRepository("gs://test_bucket/some/path", mock_client)
+    repo = GCSArtifactRepository("gs://test_bucket/some/path", client=mock_client)
 
     d = tmp_path.joinpath("data")
     d.mkdir()
@@ -154,7 +154,7 @@ def test_log_artifact(mock_client, tmp_path):
 
 
 def test_log_artifacts(mock_client, tmp_path):
-    repo = GCSArtifactRepository("gs://test_bucket/some/path", mock_client)
+    repo = GCSArtifactRepository("gs://test_bucket/some/path", client=mock_client)
 
     data = tmp_path.joinpath("data")
     data.mkdir()
@@ -192,7 +192,7 @@ def test_log_artifacts(mock_client, tmp_path):
 
 
 def test_download_artifacts_calls_expected_gcs_client_methods(mock_client, tmp_path):
-    repo = GCSArtifactRepository("gs://test_bucket/some/path", mock_client)
+    repo = GCSArtifactRepository("gs://test_bucket/some/path", client=mock_client)
 
     def mkfile(fname, **kwargs):
         fname = os.path.basename(fname)
@@ -234,7 +234,7 @@ def test_get_anonymous_bucket():
 
 def test_download_artifacts_downloads_expected_content(mock_client, tmp_path):
     artifact_root_path = "/experiment_id/run_id/"
-    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, mock_client)
+    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, client=mock_client)
 
     obj_mock_1 = mock.Mock()
     file_path_1 = "file1"
@@ -295,8 +295,8 @@ def test_download_artifacts_downloads_expected_content(mock_client, tmp_path):
 
 
 def test_delete_artifacts(mock_client):
-    experiment_root_path = "/experiment_id/"
-    repo = GCSArtifactRepository("gs://test_bucket" + experiment_root_path, mock_client)
+    experiment_root_path = "experiment_id"
+    repo = GCSArtifactRepository(f"gs://test_bucket/{experiment_root_path}", client=mock_client)
 
     def delete_file():
         del obj_mock.name
@@ -304,7 +304,7 @@ def test_delete_artifacts(mock_client):
         return obj_mock
 
     obj_mock = mock.Mock()
-    run_id_path = experiment_root_path + "run_id/"
+    run_id_path = experiment_root_path + "/run_id/"
     file_path = "file"
     attrs = {"name": run_id_path + file_path, "size": 1, "delete.side_effect": delete_file}
     obj_mock.configure_mock(**attrs)
@@ -343,9 +343,34 @@ def test_delete_artifacts(mock_client):
     assert not artifact_file_names
 
 
+@pytest.mark.parametrize("artifact_path", ["foo", "foo/"])
+def test_delete_artifacts_preserves_prefix_siblings(mock_client, artifact_path):
+    repo = GCSArtifactRepository("gs://test_bucket/root", client=mock_client)
+    target = mock.Mock(name="target")
+    target.name = "root/foo/file.txt"
+    sibling_dir = mock.Mock(name="sibling_dir")
+    sibling_dir.name = "root/foobar/keep.txt"
+    sibling_file = mock.Mock(name="sibling_file")
+    sibling_file.name = "root/foo_baz.txt"
+    mock_client.bucket.return_value.list_blobs.return_value = [
+        target,
+        sibling_dir,
+        sibling_file,
+    ]
+
+    repo.delete_artifacts(artifact_path)
+
+    mock_client.bucket.return_value.list_blobs.assert_called_once_with(
+        prefix=posixpath.join("root", artifact_path)
+    )
+    target.delete.assert_called_once_with()
+    sibling_dir.delete.assert_not_called()
+    sibling_file.delete.assert_not_called()
+
+
 def test_gcs_mpu_arguments():
     artifact_root_path = "/experiment_id/run_id/"
-    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, mock_client)
+    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, client=mock_client)
     requests_session = requests.Session()
     mock_blob = mock.MagicMock()
     mock_blob.name = "experiment_id/run_id/file.txt"
@@ -367,7 +392,7 @@ def test_create_multipart_upload(mock_client):
     bucket_name = "test_bucket"
     file_name = "file.txt"
     gcs_base_url = "gcs_base_url"
-    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, mock_client)
+    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, client=mock_client)
 
     gcs_mpu_arguments_patch = mock.patch(
         "mlflow.store.artifact.gcs_artifact_repo.GCSArtifactRepository._gcs_mpu_arguments",
@@ -413,12 +438,13 @@ def test_complete_multipart_upload(mock_client):
     bucket_name = "test_bucket"
     file_name = "file.txt"
     gcs_base_url = "gcs_base_url"
-    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, mock_client)
+    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, client=mock_client)
 
     upload_id = "some_upload_id"
-    parts = []
-    for part_number in range(1, 3):
-        parts.append(MultipartUploadPart(part_number=part_number, etag=f"etag_{part_number}"))
+    parts = [
+        MultipartUploadPart(part_number=part_number, etag=f"etag_{part_number}")
+        for part_number in range(1, 3)
+    ]
 
     gcs_mpu_arguments_patch = mock.patch(
         "mlflow.store.artifact.gcs_artifact_repo.GCSArtifactRepository._gcs_mpu_arguments",
@@ -460,7 +486,7 @@ def test_abort_multipart_upload(mock_client):
     bucket_name = "test_bucket"
     file_name = "file.txt"
     gcs_base_url = "gcs_base_url"
-    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, mock_client)
+    repo = GCSArtifactRepository("gs://test_bucket" + artifact_root_path, client=mock_client)
 
     upload_id = "some_upload_id"
     gcs_mpu_arguments_patch = mock.patch(

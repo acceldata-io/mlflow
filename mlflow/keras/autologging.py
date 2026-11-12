@@ -15,6 +15,7 @@ from mlflow.keras.callback import MlflowCallback
 from mlflow.keras.save import log_model
 from mlflow.keras.utils import get_model_signature
 from mlflow.tracking.context import registry as context_registry
+from mlflow.tracking.fluent import _initialize_logged_model
 from mlflow.utils import is_iterator
 from mlflow.utils.autologging_utils import (
     autologging_integration,
@@ -181,13 +182,11 @@ def autolog(
         # Prepare data for a 2-class classification.
         data = np.random.uniform([8, 28, 28, 3])
         label = np.random.randint(2, size=8)
-        model = keras.Sequential(
-            [
-                keras.Input([28, 28, 3]),
-                keras.layers.Flatten(),
-                keras.layers.Dense(2),
-            ]
-        )
+        model = keras.Sequential([
+            keras.Input([28, 28, 3]),
+            keras.layers.Flatten(),
+            keras.layers.Dense(2),
+        ])
         model.compile(
             loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
             optimizer=keras.optimizers.Adam(0.001),
@@ -209,7 +208,7 @@ def autolog(
         log_fn_args_as_params(original, [], kwargs, unlogged_params)
         model_id = None
         if log_models:
-            model_id = mlflow.initialize_logged_model("model").model_id
+            model_id = _initialize_logged_model("model", flavor="keras").model_id
 
         if log_datasets:
             try:

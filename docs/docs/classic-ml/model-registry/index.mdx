@@ -3,6 +3,8 @@ sidebar_position: 15
 toc_max_heading_level: 4
 sidebar_label: Overview
 pagination_next: model-registry/tutorial
+title: ML Model Registry
+description: Version, stage, and manage ML model lifecycle with MLflow's centralized model registry.
 ---
 
 import { APILink } from "@site/src/components/APILink";
@@ -12,7 +14,7 @@ import TabItem from "@theme/TabItem";
 # MLflow Model Registry
 
 The MLflow Model Registry is a centralized model store, set of APIs and a UI designed to
-collaboratively manage the full lifecycle of a model. It provides lineage (i.e., which
+collaboratively manage the full lifecycle of a machine learning model. It provides lineage (i.e., which
 MLflow experiment and run produced the model), versioning, aliasing, metadata tagging and
 annotation support to ensure that you have the full spectrum of information at every stage from development to production deployment.
 
@@ -28,7 +30,7 @@ Using the Model Registry offers the following benefits:
 - **🚀 Production-Ready Workflows**: Features like model aliases (e.g., @champion) and tags make it easier to manage deployment workflows, promoting models to experimental, staging, or production environments in a controlled and auditable way.
 - **🛡️ Governance and Compliance**: With structured metadata, tagging, and role-based access controls (when used with a backend like Databricks or a managed MLflow service), the Model Registry supports governance requirements critical for enterprise-grade ML operations.
 
-Whether you’re a solo data scientist or part of a large ML platform team, the Model Registry is a foundational component for scaling reliable and maintainable machine learning systems.
+Whether you're a solo data scientist or part of a large ML platform team, the Model Registry is a foundational component for scaling reliable and maintainable machine learning systems.
 
 ## Concepts
 
@@ -45,7 +47,7 @@ The Model Registry introduces a few concepts that describe and facilitate the fu
     <tr>
       <td>Model</td>
       <td>
-      An MLflow Model is created with one of the model flavor’s **`mlflow.<model_flavor>.log_model()`** methods, or **<APILink fn="mlflow.create_external_model"/>** API since MLflow 3.
+      An MLflow Model is created with one of the model flavor's **`mlflow.<model_flavor>.log_model()`** methods, or **<APILink fn="mlflow.create_external_model"/>** API since MLflow 3.
       Once logged, this model can then be registered with the Model Registry.
       </td>
     </tr>
@@ -106,7 +108,7 @@ levels of integration, governance, and collaboration features.
 
 ### Model Registry in OSS MLflow
 
-In the open-source version of MLflow, the Model Registry provides both a UI and API for managing the lifecycle of machine learning models.
+In the open-source version of MLflow for ML Models, the Model Registry provides both a UI and API for versioning and managing ML models.
 You can register models, track versions, add tags and descriptions, and transition models between stages such as Staging and Production.
 
 <details>
@@ -153,9 +155,9 @@ You can register models, track versions, add tags and descriptions, and transiti
 
 To learn more about the OSS Model Registry, refer to the [tutorial on the model registry](./tutorial).
 
-### Model Resgitry in Databricks
+### Model Registry in Databricks
 
-Databricks extends MLflow’s capabilities by integrating the Model Registry with Unity Catalog, enabling centralized governance, fine-grained access control, and cross-workspace collaboration.
+Databricks extends MLflow's capabilities by integrating the Model Registry with Unity Catalog, enabling centralized governance, fine-grained access control, and cross-workspace collaboration.
 
 Key benefits of Unity Catalog integration include:
 

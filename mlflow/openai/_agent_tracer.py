@@ -2,31 +2,38 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional
+import weakref
+from typing import Any
 
 import agents.tracing as oai
-from agents import add_trace_processor
-from agents._run_impl import TraceCtxManager
-from agents.tracing.setup import GLOBAL_TRACE_PROVIDER
-from pydantic import BaseModel
+from agents import add_trace_processor, set_trace_processors
+from agents.tracing.setup import get_trace_provider
 
 from mlflow.entities.span import LiveSpan, SpanType
 from mlflow.entities.span_event import SpanEvent
 from mlflow.entities.span_status import SpanStatus, SpanStatusCode
-from mlflow.openai import FLAVOR_NAME
-from mlflow.tracing.constant import SpanAttributeKey
-from mlflow.tracing.fluent import start_span_no_context
-from mlflow.types.chat import (
-    ChatMessage,
-    ChatTool,
-    Function,
-    FunctionToolDefinition,
-    TextContentPart,
-    ToolCall,
+from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey
+from mlflow.tracing.fluent import (
+    get_current_active_span,
+    start_span,
+    start_span_no_context,
 )
-from mlflow.utils.autologging_utils.safety import safe_patch
+from mlflow.tracing.provider import detach_span_from_context, set_span_in_context
+from mlflow.tracing.utils import construct_full_inputs
+from mlflow.tracing.utils.token import SpanWithToken
+from mlflow.types.chat import (
+    ChatTool,
+    FunctionToolDefinition,
+)
 
 _logger = logging.getLogger(__name__)
+
+
+_AGENT_RUN_SPAN_NAME = "AgentRunner.run"
+_AGENT_RUN_STREAMED_SPAN_NAME = "AgentRunner.run_streamed"
+# Private marker attribute used to identify a root span created by our patches,
+# decoupling root detection from the human-readable span name.
+_AGENT_RUN_ROOT_MARKER = "mlflow.openai.agent_run_root"
 
 
 class OpenAISpanType:
@@ -48,13 +55,22 @@ _SPAN_TYPE_MAP = {
     OpenAISpanType.FUNCTION: SpanType.TOOL,
     OpenAISpanType.GENERATION: SpanType.CHAT_MODEL,
     OpenAISpanType.RESPONSE: SpanType.CHAT_MODEL,
-    OpenAISpanType.GUARDRAIL: SpanType.TOOL,
+    OpenAISpanType.GUARDRAIL: SpanType.GUARDRAIL,
     # Default to chain type
 }
 
 
+def clear_trace_processors():
+    """
+    Clear all trace processors (including the default OpenAI agents tracer)
+    to avoid warnings when the OpenAI API key is not set.
+    https://github.com/openai/openai-agents-python/issues/1387#issuecomment-3165660183
+    """
+    set_trace_processors([])
+
+
 def add_mlflow_trace_processor():
-    processors = GLOBAL_TRACE_PROVIDER._multi_processor._processors
+    processors = get_trace_provider()._multi_processor._processors
 
     if any(isinstance(p, MlflowOpenAgentTracingProcessor) for p in processors):
         return
@@ -63,46 +79,31 @@ def add_mlflow_trace_processor():
 
 
 def remove_mlflow_trace_processor():
-    processors = GLOBAL_TRACE_PROVIDER._multi_processor._processors
+    processors = get_trace_provider()._multi_processor._processors
     non_mlflow_processors = [
         p for p in processors if not isinstance(p, MlflowOpenAgentTracingProcessor)
     ]
-    GLOBAL_TRACE_PROVIDER._multi_processor._processors = non_mlflow_processors
+    get_trace_provider()._multi_processor._processors = non_mlflow_processors
 
 
 class MlflowOpenAgentTracingProcessor(oai.TracingProcessor):
     def __init__(
         self,
-        project_name: Optional[str] = None,
+        project_name: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self._span_id_to_mlflow_span: dict[str, LiveSpan] = {}
-        self._project_name = project_name
-
-        # Patch TraceCtxManager to handle exceptions from the agent properly
-        # The original implementation does not propagate exception to the root span,
-        # resulting in the trace to have status OK even if there is an exception.
-        def _patched_exit(original, instance, exc_type, exc_val, exc_tb):
-            try:
-                if exc_val and instance.trace:
-                    span = self._span_id_to_mlflow_span.get(instance.trace.trace_id)
-                    span.add_event(SpanEvent.from_exception(exc_val))
-                    span.set_status(SpanStatusCode.ERROR)
-            except Exception:
-                _logger.debug("Failed to handle exception in MLflow trace", exc_info=True)
-
-            return original(instance, exc_type, exc_val, exc_tb)
-
-        safe_patch(
-            FLAVOR_NAME,
-            TraceCtxManager,
-            "__exit__",
-            _patched_exit,
-        )
+        self._span_id_to_mlflow_span: dict[str, SpanWithToken] = {}
 
     def on_trace_start(self, trace: oai.Trace) -> None:
-        try:
+        if (active_span := get_current_active_span()) and _is_agent_run_root(active_span):
+            # The root span is already started by _patched_agent_run / _patched_agent_run_streamed
+            mlflow_span = active_span
+            token = None
+        else:
+            # Users create a trace using `agents.trace` in OpenAI Agent SDK
+            # Ref: ...
+            # We need to create a corresponding MLflow span to track the trace
             mlflow_span = start_span_no_context(
                 name=trace.name,
                 span_type=SpanType.AGENT,
@@ -110,65 +111,57 @@ class MlflowOpenAgentTracingProcessor(oai.TracingProcessor):
                 inputs="",
                 attributes=trace.metadata,
             )
-            # NB: Trace ID has different prefix as span ID so will not conflict
-            self._span_id_to_mlflow_span[trace.trace_id] = mlflow_span
+            token = set_span_in_context(mlflow_span)
 
-            if trace.group_id:
-                # Group ID is used for grouping multiple agent executions together
-                mlflow_span.set_tag("group_id", trace.group_id)
+        # NB: Trace ID has different prefix as span ID so will not conflict
+        self._span_id_to_mlflow_span[trace.trace_id] = SpanWithToken(mlflow_span, token)
 
-            original_exit = trace.__exit__
-
-            # Patch __exit__ method to handle exception properly
-            def _patched_exit(self, exc_type, exc_val, exc_tb):
-                if exc_val:
-                    mlflow_span.add_event(SpanEvent.from_exception(exc_val))
-                    mlflow_span.set_status(SpanStatusCode.ERROR)
-
-                original_exit(exc_type, exc_val, exc_tb)
-
-            safe_patch(
-                FLAVOR_NAME,
-                trace.__class__,
-                "__exit__",
-                _patched_exit,
-            )
-
-        except Exception:
-            _logger.debug("Failed to start MLflow trace", exc_info=True)
+        if trace.group_id:
+            # Group ID is used for grouping multiple agent executions together
+            mlflow_span.set_tag("group_id", trace.group_id)
 
     def on_trace_end(self, trace: oai.Trace) -> None:
         try:
-            mlflow_span = self._span_id_to_mlflow_span.pop(trace.trace_id, None)
-            mlflow_span.end(status=mlflow_span.status, outputs="")
+            st = self._span_id_to_mlflow_span.pop(trace.trace_id, None)
+            if st and st.token:
+                detach_span_from_context(st.token)
+                st.span.end(status=st.span.status, outputs="")
         except Exception:
             _logger.debug("Failed to end MLflow trace", exc_info=True)
 
     def on_span_start(self, span: oai.Span[Any]) -> None:
         try:
-            parent_mlflow_span = self._span_id_to_mlflow_span.get(span.parent_id)
+            parent_st: SpanWithToken | None = self._span_id_to_mlflow_span.get(span.parent_id, None)
 
             # Parent might be a trace
-            if not parent_mlflow_span:
-                parent_mlflow_span = self._span_id_to_mlflow_span.get(span.trace_id)
+            if not parent_st:
+                parent_st = self._span_id_to_mlflow_span.get(span.trace_id, None)
 
             inputs, _, attributes = _parse_span_data(span.span_data)
+            span_type = _SPAN_TYPE_MAP.get(span.span_data.type, SpanType.CHAIN)
 
             mlflow_span = start_span_no_context(
                 name=_get_span_name(span.span_data),
-                span_type=_SPAN_TYPE_MAP.get(span.span_data.type, SpanType.CHAIN),
-                parent_span=parent_mlflow_span,
+                span_type=span_type,
+                parent_span=parent_st.span if parent_st else None,
                 inputs=inputs,
                 attributes=attributes,
             )
-            self._span_id_to_mlflow_span[span.span_id] = mlflow_span
+            token = set_span_in_context(mlflow_span)
+
+            if span_type == SpanType.CHAT_MODEL:
+                mlflow_span.set_attribute(SpanAttributeKey.MESSAGE_FORMAT, "openai-agent")
+
+            self._span_id_to_mlflow_span[span.span_id] = SpanWithToken(mlflow_span, token)
         except Exception:
             _logger.debug("Failed to start MLflow span", exc_info=True)
 
     def on_span_end(self, span: oai.Span[Any]) -> None:
         try:
             # parsed_span_data = parse_spandata(span.span_data)
-            mlflow_span = self._span_id_to_mlflow_span.pop(span.span_id, None)
+            st: SpanWithToken | None = self._span_id_to_mlflow_span.pop(span.span_id, None)
+            detach_span_from_context(st.token)
+            mlflow_span = st.span
 
             inputs, outputs, attributes = _parse_span_data(span.span_data)
 
@@ -243,10 +236,11 @@ def _parse_span_data(span_data: oai.SpanData) -> tuple[Any, Any, dict[str, Any]]
         inputs = span_data.input
         outputs = span_data.output
         attributes = {
-            "model": span_data.model,
+            SpanAttributeKey.MODEL: span_data.model,
             "model_config": span_data.model_config,
-            "usage": span_data.usage,
         }
+        if usage := _parse_generation_usage(span_data.usage):
+            attributes[SpanAttributeKey.CHAT_USAGE] = usage
 
     elif span_data.type == OpenAISpanType.RESPONSE:
         inputs, outputs, attributes = _parse_response_span_data(span_data)
@@ -264,24 +258,35 @@ def _parse_span_data(span_data: oai.SpanData) -> tuple[Any, Any, dict[str, Any]]
     return inputs, outputs, attributes
 
 
+def _parse_generation_usage(usage: dict[str, int] | None) -> dict[str, int] | None:
+    if not usage:
+        return None
+    try:
+        result = {}
+        for key in [
+            TokenUsageKey.INPUT_TOKENS,
+            TokenUsageKey.OUTPUT_TOKENS,
+            TokenUsageKey.TOTAL_TOKENS,
+        ]:
+            if (v := usage.get(key)) is not None:
+                result[key] = v
+        if details := usage.get("input_tokens_details"):
+            if (v := details.get("cached_tokens")) is not None:
+                result[TokenUsageKey.CACHE_READ_INPUT_TOKENS] = v
+            if (v := details.get("cache_write_tokens")) is not None:
+                result[TokenUsageKey.CACHE_CREATION_INPUT_TOKENS] = v
+        return result or None
+    except Exception:
+        _logger.debug("Failed to parse generation span usage", exc_info=True)
+        return None
+
+
 def _parse_response_span_data(span_data: oai.ResponseSpanData) -> tuple[Any, Any, dict[str, Any]]:
     inputs = span_data.input
     response = span_data.response
     response_dict = response.model_dump() if response else {}
     outputs = response_dict.get("output")
     attributes = {k: v for k, v in response_dict.items() if k != "output"}
-
-    # Extract chat messages
-    messages = []
-    if response and response.instructions:
-        messages.append(ChatMessage(role="system", content=span_data.response.instructions))
-    if span_data.input:
-        parsed = [_parse_message_like(m) for m in span_data.input]
-        messages.extend([m for m in parsed if m is not None])
-    if response and response.output:
-        parsed = [_parse_message_like(m) for m in span_data.response.output]
-        messages.extend(parsed)
-    attributes[SpanAttributeKey.CHAT_MESSAGES] = [m.model_dump_compat() for m in messages]
 
     # Extract chat tools
     chat_tools = []
@@ -306,59 +311,132 @@ def _parse_response_span_data(span_data: oai.ResponseSpanData) -> tuple[Any, Any
     return inputs, outputs, attributes
 
 
-def _parse_message_like(message_like: Any) -> Optional[ChatMessage]:
+def _is_agent_run_root(span: LiveSpan) -> bool:
+    return bool(span.get_attribute(_AGENT_RUN_ROOT_MARKER))
+
+
+def _build_agent_run_span_args(original, self_, args, kwargs):
+    """Build inputs and attributes for the agent run root span.
+
+    Excludes "run_config" because it may contain the model_provider which holds
+    the AsyncOpenAI client. Serializing it triggers copy.deepcopy on the internal
+    AsyncHttpxClientWrapper, which fails due to unpicklable locks and causes
+    "AttributeError: 'AsyncHttpxClientWrapper' object has no attribute '_state'"
+    errors during garbage collection. See https://github.com/mlflow/mlflow/issues/19911
+    """
+    inputs = construct_full_inputs(original, self_, *args, **kwargs)
+    attributes = {
+        k: v for k, v in inputs.items() if k not in ("starting_agent", "input", "run_config")
+    }
+    return inputs, attributes
+
+
+async def _patched_agent_run(original, self, *args, **kwargs):
+    inputs, attributes = _build_agent_run_span_args(original, self, args, kwargs)
+
+    with start_span(
+        name=_AGENT_RUN_SPAN_NAME,
+        span_type=SpanType.AGENT,
+        attributes=attributes,
+    ) as span:
+        span.set_attribute(_AGENT_RUN_ROOT_MARKER, True)
+        span.set_inputs(inputs.get("input"))
+        result = await original(self, *args, **kwargs)
+        span.set_outputs(result.final_output)
+
+    return result
+
+
+def _patched_agent_run_streamed(original, self, *args, **kwargs):
+    """Patch ``AgentRunner.run_streamed`` to record an MLflow root span.
+
+    ``run_streamed`` is sync and returns a ``RunResultStreaming`` immediately
+    while spawning the actual run as an ``asyncio`` background task. The span
+    must therefore outlive the patched call. Cleanup happens via one of two
+    paths:
+
+    1. Iteration: the wrapped ``stream_events()`` ends the span and detaches
+       the GC finalizer when iteration completes (or raises).
+    2. Discard: a ``weakref.finalize`` callback closes the span if ``result``
+       is garbage-collected before iteration starts.
+    """
+    inputs, attributes = _build_agent_run_span_args(original, self, args, kwargs)
+
+    span = start_span_no_context(
+        name=_AGENT_RUN_STREAMED_SPAN_NAME,
+        span_type=SpanType.AGENT,
+        inputs=inputs.get("input"),
+        attributes=attributes,
+    )
+    span.set_attribute(_AGENT_RUN_ROOT_MARKER, True)
+    # Attach the span before original() runs so the asyncio task it spawns
+    # captures this span as its OTel context.
+    token = set_span_in_context(span)
+
     try:
-        return ChatMessage.validate_compat(message_like)
+        result = original(self, *args, **kwargs)
+    except Exception as e:
+        _finalize_streamed_span(span, token, error=e)
+        raise
+
+    finalizer = weakref.finalize(result, _finalize_streamed_span, span, token)
+    # Capture `stream_events` as the *unbound* function and reference `result`
+    # weakly: a bound method (`result.stream_events`) would have its closure cell
+    # strong-reference `result`, forming a cycle that prevents the GC finalizer
+    # from ever firing.
+    original_stream_events_func = type(result).stream_events
+    result_ref = weakref.ref(result)
+
+    async def wrapped_stream_events(*args, **kwargs):
+        # Reachable only via `result.stream_events`, so `result` is alive here;
+        # pinning it locally keeps it that way for the duration of iteration.
+        live_result = result_ref()
+        if not finalizer.alive:
+            # Re-iteration after finalize: pass through without touching span.
+            async for event in original_stream_events_func(live_result, *args, **kwargs):
+                yield event
+            return
+        error: Exception | None = None
+        try:
+            async for event in original_stream_events_func(live_result, *args, **kwargs):
+                yield event
+        except Exception as e:
+            error = e
+            raise
+        finally:
+            # `detach()` returns the original args tuple if we still owned the
+            # finalizer, or None if the GC callback already fired; finalize only
+            # when this iteration is the one that owns cleanup.
+            if finalizer.detach() is not None:
+                outputs = None if error else live_result.final_output
+                _finalize_streamed_span(span, token, error=error, outputs=outputs)
+
+    result.stream_events = wrapped_stream_events
+    return result
+
+
+def _safe_detach_span_context(token):
+    """Best-effort detach: tolerates being called from a different OTel context
+    (e.g., from a ``weakref.finalize`` callback) so callers can still end the
+    span afterwards. Same pattern as ``mlflow/langchain/langchain_tracer.py``.
+    """
+    if token is None:
+        return
+    try:
+        detach_span_from_context(token)
+    except ValueError:
+        _logger.debug("Failed to detach span context", exc_info=True)
+
+
+def _finalize_streamed_span(span, token, *, error=None, outputs=None):
+    _safe_detach_span_context(token)
+    try:
+        if error is not None:
+            span.record_exception(error)
+            span.end()
+            return
+        if outputs is not None:
+            span.set_outputs(outputs)
+        span.end(status=SpanStatusCode.OK)
     except Exception:
-        pass
-
-    if isinstance(message_like, BaseModel):
-        message_like = message_like.model_dump()
-
-    msg_type = message_like["type"]
-    if msg_type == "message":
-        content = []
-        refusal = None
-        for content_block in message_like["content"]:
-            # Content is a list of either text or refusal https://github.com/openai/openai-python/blob/9dea82fb8cdd06683f9e8033b54cff219789af7f/src/openai/types/responses/response_output_message.py#L13C38-L13C56
-            if "text" in content_block:
-                content.append(TextContentPart(type="text", text=content_block["text"]))
-            elif "refusal" in content_block:
-                refusal = content_block["refusal"]
-            else:
-                _logger.debug(f"Unknown content type in message: {content_block}")
-        return ChatMessage(
-            role=message_like["role"],
-            content=content,
-            refusal=refusal,
-        )
-    elif msg_type == "function_call":
-        return ChatMessage(
-            role="assistant",
-            content="",
-            tool_calls=[
-                ToolCall(
-                    id=message_like["call_id"],
-                    function=Function(
-                        name=message_like["name"],
-                        arguments=message_like["arguments"],
-                    ),
-                )
-            ],
-        )
-    elif msg_type == "function_call_output":
-        return ChatMessage(
-            role="tool",
-            content=message_like["output"],
-            tool_call_id=message_like["call_id"],
-        )
-
-    # Ignore unknown message types.
-    # Response API supports the following additional message types, which is not
-    # supported by our chat standard schema yet:
-    # https://github.com/openai/openai-python/blob/9dea82fb8cdd06683f9e8033b54cff219789af7f/src/openai/types/responses/response_output_item.py#L16
-    # - File search tool call
-    # - Web search tool call
-    # - Computer tool call
-    # - Reasoning
-    _logger.debug(f"Unknown message type: {msg_type}")
+        _logger.warning("Failed to finalize streamed agent run span", exc_info=True)

@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Optional, Sequence
+from typing import Any, Sequence
 
 from cachetools import TTLCache
 from opentelemetry.sdk.trace import ReadableSpan
@@ -8,7 +8,7 @@ from opentelemetry.sdk.trace.export import SpanExporter
 from mlflow.entities.model_registry import PromptVersion
 from mlflow.entities.trace import Trace
 from mlflow.environment_variables import (
-    _MLFLOW_ENABLE_TRACE_DUAL_WRITE_IN_MODEL_SERVING,
+    MLFLOW_EXPERIMENT_ID,
     MLFLOW_TRACE_BUFFER_MAX_SIZE,
     MLFLOW_TRACE_BUFFER_TTL_SECONDS,
 )
@@ -17,17 +17,42 @@ from mlflow.tracing.export.async_export_queue import AsyncTraceExportQueue, Task
 from mlflow.tracing.export.utils import try_link_prompts_to_trace
 from mlflow.tracing.fluent import _set_last_active_trace_id
 from mlflow.tracing.trace_manager import InMemoryTraceManager
-from mlflow.tracing.utils import add_size_bytes_to_trace_metadata
+from mlflow.tracing.utils import add_size_stats_to_trace_metadata
 
 _logger = logging.getLogger(__name__)
 
 
-def pop_trace(request_id: str) -> Optional[dict[str, Any]]:
+def pop_trace(request_id: str) -> dict[str, Any] | None:
     """
     Pop the completed trace data from the buffer. This method is used in
     the Databricks model serving so please be careful when modifying it.
     """
+    if request_id not in _TRACE_BUFFER:
+        _logger.debug(
+            f"Request ID {request_id} not found in TRACE_BUFFER, "
+            f"available request IDs: {_TRACE_BUFFER.keys()}"
+        )
     return _TRACE_BUFFER.pop(request_id, None)
+
+
+def maybe_add_trace_to_serving_buffer(trace: "Trace") -> None:
+    """Store a finished trace in the serving buffer so Model Serving can return it in the response.
+
+    The scoring server reads the completed trace from ``_TRACE_BUFFER`` (keyed by client request
+    ID) after ``predict()`` returns. Exporters that write spans elsewhere than the inference table
+    (e.g. the UC table exporter) call this so the endpoint can still return the trace. The buffer
+    is in-memory, so this does not duplicate the exporter's own span/trace export.
+
+    No-op outside model serving, or when the trace has no client request ID to key on.
+    """
+    from mlflow.utils.databricks_utils import is_in_databricks_model_serving_environment
+
+    if not is_in_databricks_model_serving_environment():
+        return
+    if not (client_request_id := trace.info.client_request_id):
+        return
+    _TRACE_BUFFER[client_request_id] = trace.to_dict()
+    _logger.debug(f"Added {client_request_id} to TRACE_BUFFER")
 
 
 # For Inference Table, we use special TTLCache to store the finished traces
@@ -56,13 +81,7 @@ class InferenceTableSpanExporter(SpanExporter):
 
     def __init__(self):
         self._trace_manager = InMemoryTraceManager.get_instance()
-
-        # NB: When this env var is set to true, MLflow will export traces to both inference
-        #  table and the Databricks Tracing Server.
-        self._should_write_to_mlflow_backend = (
-            _MLFLOW_ENABLE_TRACE_DUAL_WRITE_IN_MODEL_SERVING.get()
-        )
-        if self._should_write_to_mlflow_backend:
+        if MLFLOW_EXPERIMENT_ID.get():
             self._client = TracingClient("databricks")
             self._async_queue = AsyncTraceExportQueue()
 
@@ -84,22 +103,27 @@ class InferenceTableSpanExporter(SpanExporter):
                 _logger.debug(f"Trace for span {span} not found. Skipping export.")
                 continue
 
+            if manager_trace.is_remote_trace:
+                _logger.warning(
+                    f"Mlflow does not support exporting the span {span.name} that is created "
+                    "in a remote process to Databricks InferenceTable."
+                )
+                continue
+
             trace = manager_trace.trace
             _set_last_active_trace_id(trace.info.trace_id)
 
             # Add the trace to the in-memory buffer so it can be retrieved by upstream
             # The key is Databricks request ID.
             _TRACE_BUFFER[trace.info.client_request_id] = trace.to_dict()
+            _logger.debug(f"Added {trace.info.client_request_id} to TRACE_BUFFER")
 
-            if self._should_write_to_mlflow_backend:
+            # Export to MLflow backend if experiment ID is set
+            if MLFLOW_EXPERIMENT_ID.get():
                 if trace.info.experiment_id is None:
-                    # NB: The experiment ID is set based on the MLFLOW_EXPERIMENT_ID env var
-                    #   populated in the scoring server by Agent Framework. If the model is not
-                    #   deployed via agents.deploy(), the env var will not be set and the
-                    #   experiment will be empty, even if the dual write itself is enabled.
-                    _logger.warning(
-                        "Dual write to MLflow backend is enabled, but experiment ID is not set "
-                        "for the trace. Skipping trace export to MLflow backend."
+                    _logger.debug(
+                        f"{MLFLOW_EXPERIMENT_ID.name} is set, but trace {trace.info.trace_id} "
+                        "has no experiment ID. Skipping export."
                     )
                     continue
 
@@ -119,12 +143,9 @@ class InferenceTableSpanExporter(SpanExporter):
                     )
 
     def _log_trace_to_mlflow_backend(self, trace: Trace, prompts: Sequence[PromptVersion]):
-        try:
-            add_size_bytes_to_trace_metadata(trace)
-        except Exception:
-            _logger.warning("Failed to add size bytes to trace metadata.", exc_info=True)
+        add_size_stats_to_trace_metadata(trace)
 
-        returned_trace_info = self._client.start_trace_v3(trace)
+        returned_trace_info = self._client.start_trace(trace.info)
         self._client._upload_trace_data(returned_trace_info, trace.data)
 
         # Link prompt versions to the trace. Prompt linking is not critical for trace export

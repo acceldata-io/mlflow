@@ -3,7 +3,7 @@ import sys
 from unittest import mock
 
 import pytest
-import sklearn.neighbors as knn
+import sklearn.linear_model as logreg_module
 from sklearn import datasets
 
 import mlflow.sklearn
@@ -20,9 +20,9 @@ def sklearn_knn_model():
     iris = datasets.load_iris()
     X = iris.data[:, :2]  # we only take the first two features.
     y = iris.target
-    knn_model = knn.KNeighborsClassifier()
-    knn_model.fit(X, y)
-    return knn_model
+    logreg_model = logreg_module.LogisticRegression()
+    logreg_model.fit(X, y)
+    return logreg_model
 
 
 @pytest.fixture
@@ -88,14 +88,14 @@ def test_add_code_to_system_path(sklearn_knn_model, model_path):
     assert "site-packages" in sys.modules["pandas"].__file__
 
 
-@mock.patch("builtins.open", side_effect=OSError("[Errno 95] Operation not supported"))
 def test_add_code_to_system_path_not_copyable_file(sklearn_knn_model, model_path):
-    with pytest.raises(MlflowException, match=r"Failed to copy the specified code path"):
-        mlflow.sklearn.save_model(
-            sk_model=sklearn_knn_model,
-            path=model_path,
-            code_paths=["tests/utils/test_resources/dummy_module.py"],
-        )
+    with mock.patch("builtins.open", side_effect=OSError("[Errno 95] Operation not supported")):
+        with pytest.raises(MlflowException, match=r"Failed to copy the specified code path"):
+            mlflow.sklearn.save_model(
+                sk_model=sklearn_knn_model,
+                path=model_path,
+                code_paths=["tests/utils/test_resources/dummy_module.py"],
+            )
 
 
 def test_env_var_tracker(monkeypatch):

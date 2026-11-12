@@ -1,4 +1,6 @@
-from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Mapping, Sequence, Union
+
+from packaging.version import Version
 
 from mlflow.data.dataset_source import DatasetSource
 
@@ -12,14 +14,12 @@ class HuggingFaceDatasetSource(DatasetSource):
     def __init__(
         self,
         path: str,
-        config_name: Optional[str] = None,
-        data_dir: Optional[str] = None,
-        data_files: Optional[
-            Union[str, Sequence[str], Mapping[str, Union[str, Sequence[str]]]]
-        ] = None,
-        split: Optional[Union[str, "datasets.Split"]] = None,
-        revision: Optional[Union[str, "datasets.Version"]] = None,
-        trust_remote_code: Optional[bool] = None,
+        config_name: str | None = None,
+        data_dir: str | None = None,
+        data_files: str | Sequence[str] | Mapping[str, str | Sequence[str]] | None = None,
+        split: Union[str, "datasets.Split"] | None = None,
+        revision: Union[str, "datasets.Version"] | None = None,
+        trust_remote_code: bool | None = None,
     ):
         """Create a `HuggingFaceDatasetSource` instance.
 
@@ -31,7 +31,7 @@ class HuggingFaceDatasetSource(DatasetSource):
         Args:
             path: The path of the Hugging Face dataset, if it is a dataset from HuggingFace hub,
                 `path` must match the hub path, e.g., "databricks/databricks-dolly-15k".
-            config_name: The name of of the Hugging Face dataset configuration.
+            config_name: The name of the Hugging Face dataset configuration.
             data_dir: The `data_dir` of the Hugging Face dataset configuration.
             data_files: Paths to source data file(s) for the Hugging Face dataset configuration.
             split: Which split of the data to load.
@@ -61,7 +61,6 @@ class HuggingFaceDatasetSource(DatasetSource):
             An instance of `datasets.Dataset`.
         """
         import datasets
-        from packaging.version import Version
 
         load_kwargs = {
             "path": self.path,
@@ -76,13 +75,12 @@ class HuggingFaceDatasetSource(DatasetSource):
         if Version(datasets.__version__) >= Version("2.16.0"):
             load_kwargs["trust_remote_code"] = self.trust_remote_code
 
-        intersecting_keys = set(load_kwargs.keys()) & set(kwargs.keys())
-        if intersecting_keys:
+        if intersecting_keys := set(load_kwargs.keys()) & set(kwargs.keys()):
             raise KeyError(
                 f"Found duplicated arguments in `HuggingFaceDatasetSource` and "
                 f"`kwargs`: {intersecting_keys}. Please remove them from `kwargs`."
             )
-            load_kwargs.update(kwargs)
+        load_kwargs.update(kwargs)
         return datasets.load_dataset(**load_kwargs)
 
     @staticmethod
